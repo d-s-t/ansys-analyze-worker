@@ -2,10 +2,11 @@
 
 A generic background service that watches a task queue and runs Ansys
 Electronics Desktop (AEDT) analyses on it -- plus the shared `queue_common`
-schema that any "Part 1" (model-building) and "Part 3" (results-consuming)
-project uses to talk to it. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-for the full design doc, task/result JSON schema, and a guide to writing
-new Part 1/Part 3 scripts against this package.
+schema that any client pipeline (a project that builds AEDT models,
+queues them, monitors progress, and plots results) uses to talk to it.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design
+doc, task/result JSON schema, and a guide to writing a client pipeline
+against this worker.
 
 This repo holds **two separate installable packages**, in two
 subdirectories, so a client project can depend on just the lightweight
@@ -14,7 +15,7 @@ one it actually needs:
 | Package | Subdirectory | Contains | Needs |
 |---|---|---|---|
 | `ansys-analyze-common` | `common/` | `queue_common.py` only -- the shared, dependency-free (stdlib only) task/result schema. | nothing |
-| `ansys-analyze-worker` | `worker/` | Part 2 itself: the background service, tray app, post-processing, handlers. | `ansys-analyze-common`, `pyaedt`, `pandas`, `matplotlib`, `pystray`, `Pillow` |
+| `ansys-analyze-worker` | `worker/` | The worker itself: the background service, tray app, post-processing, handlers. | `ansys-analyze-common`, `pyaedt`, `pandas`, `matplotlib`, `pystray`, `Pillow` |
 
 ## Install
 
@@ -42,18 +43,17 @@ pip install -e common/
 pip install -e worker/
 ```
 
-### On a client machine/project (Part 1 or Part 3 scripts)
+### On the client pipeline's machine/project
 
-A client only ever needs `ansys_analyze_common.queue_common`, which is
-pure stdlib -- no need to drag in AEDT or plotting libraries it never
-imports. Install just the `common/` package:
+A client pipeline only ever needs `ansys_analyze_common.queue_common`,
+which is pure stdlib -- no need to drag in AEDT or plotting libraries it
+never imports. Install just the `common/` package:
 
 ```
 pip install "git+https://github.com/d-s-t/ansys-analyze-worker.git#subdirectory=common"
 ```
 
-or add that same line to the client project's `requirements.txt` (see
-e.g. `microwave-package`'s `requirements.txt`).
+or add that same line to the client project's `requirements.txt`.
 
 ### Pinning a specific version
 
@@ -108,10 +108,10 @@ To support a new solution type or design, add a module to
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) section 6. Nothing else in
 the worker needs to change.
 
-## Depending on this from another project
+## Depending on this from a client pipeline
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) sections 8-9 for the
-full guide to authoring Part 1/Part 3 scripts. In short, in the other
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) section 8 for the
+full guide to authoring a client pipeline. In short, in the other
 project's `requirements.txt`:
 
 ```
