@@ -13,9 +13,10 @@ A tray icon (bottom-right of the Windows taskbar) lets you pause/resume,
 reset, or exit without hunting for a console window.
 
 HOW TO RUN THIS (pick one):
-  - After `pip install -e .` (or a non-editable install) in this repo:
+  - After `pip install .` (or an editable install) of the worker/ package
+    in this repo:
         ansys-analyze-worker
-    (the console-script entry point defined in pyproject.toml)
+    (the console-script entry point defined in worker/pyproject.toml)
   - Or directly as a module, without needing the console-script:
         python -m ansys_analyze_worker.run_service
   - To run automatically at logon (like OneDrive), put a shortcut to
@@ -35,7 +36,8 @@ import os
 import sys
 import threading
 
-from .queue_common import QueuePaths
+from ansys_analyze_common.queue_common import QueuePaths
+
 from .worker import Worker
 
 

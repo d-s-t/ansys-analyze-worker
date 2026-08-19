@@ -7,35 +7,63 @@ should not need to change when you add a new design or solution type.
 
 ---
 
-## 0. Two repos
+## 0. Two repos, two installable packages
 
-This repo, `ansys-analyze-worker`, **is** Part 2 — the generic background
-worker plus the `queue_common` schema module that Part 1/Part 3 scripts
-import. It's meant to be installed as a dependency, not copied around:
+This repo, `ansys-analyze-worker`, holds **two separate installable
+Python packages** in two subdirectories, so a project can depend on just
+the one it actually needs instead of pulling in the other's dependencies
+(or its files) at all:
+
+| Package | Subdirectory | Contains | Depends on |
+|---|---|---|---|
+| `ansys-analyze-common` | `common/` | `queue_common.py` only -- the shared, dependency-free (stdlib only) task/result schema. | nothing |
+| `ansys-analyze-worker` | `worker/` | Part 2 itself: `run_service.py`, `worker.py`, `tray_app.py`, `post_processing.py`, `handlers/`. | `ansys-analyze-common`, `pyaedt`, `pandas`, `matplotlib`, `pystray`, `Pillow` |
+
+Not published to PyPI -- install straight from GitHub, using pip's
+`#subdirectory=` fragment to pick which of the two you want:
 
 ```
-pip install -e path/to/ansys-analyze-worker
+# On the AEDT machine (Part 2 itself):
+pip install "git+https://github.com/d-s-t/ansys-analyze-worker.git#subdirectory=worker"
+
+# In an experiment repo (Part 1/Part 3 scripts) -- just the schema, none
+# of the worker's files or dependencies:
+pip install "git+https://github.com/d-s-t/ansys-analyze-worker.git#subdirectory=common"
 ```
+
+`worker/pyproject.toml` declares `ansys-analyze-common` as a normal
+dependency (via the same git URL), so installing the worker package
+alone pulls the common one in automatically -- you never need both lines
+for the worker machine.
 
 Everything experiment-specific — Part 1 and Part 3 scripts — lives in a
 **separate repo per experiment** (e.g. `pedestal_experiment`), which
-depends on this one via `requirements.txt`:
+depends on `ansys-analyze-common` via `requirements.txt`:
 
 ```
--e path/to/ansys-analyze-worker
+git+https://github.com/d-s-t/ansys-analyze-worker.git#subdirectory=common
 ```
 
 and then imports the schema normally:
 
 ```python
-from ansys_analyze_worker import queue_common
+from ansys_analyze_common import queue_common
 ```
 
-This is a real dependency relationship, not a shared-folder convention —
-editing this repo (this is an editable install) changes what every
-depending project sees immediately, no copying or reinstalling. §8/§9
-are written from the point of view of that separate, experiment-specific
-repo; §10 covers this repo's own internals.
+Pin either install to a specific tag/branch/commit by appending `@<ref>`
+right before the `#subdirectory=...` fragment, e.g.
+`git+https://github.com/d-s-t/ansys-analyze-worker.git@v0.1.0#subdirectory=common`.
+
+For local development on this repo (edits take effect immediately, no
+reinstall needed -- pairs well with the tray app's "Reset" option):
+
+```
+pip install -e common/
+pip install -e worker/       # pulls in common/ automatically too
+```
+
+§8/§9 are written from the point of view of the separate,
+experiment-specific repo; §10 covers this repo's own internals.
 
 ---
 
@@ -44,7 +72,7 @@ repo; §10 covers this repo's own internals.
 | Part | Lives in | Runs on | License needed | Job | Changes per experiment? |
 |---|---|---|---|---|---|
 | **Part 1** | the experiment repo (e.g. `pedestal_experiment`) | Your modeling PC | Student version | Build the geometry, assign materials/boundaries, save the `.aedt` file, and drop a **task file** describing what analysis to run | **Yes** — new script per experiment/design |
-| **Part 2** | **this repo**, `ansys-analyze-worker` | The PC with the full license, AEDT already open | Full version | Sits in the background, watches a queue folder, picks up task files, runs whatever analysis they describe, writes results | **No** — generic engine + a small "handler" module per analysis type |
+| **Part 2** | **this repo**, `ansys-analyze-worker` (the `worker/` package) | The PC with the full license, AEDT already open | Full version | Sits in the background, watches a queue folder, picks up task files, runs whatever analysis they describe, writes results | **No** — generic engine + a small "handler" module per analysis type |
 | **Part 3** | the experiment repo | Anywhere (just needs the result files) | None (no AEDT needed) | Reads the result files Part 2 produced and turns them into the plots/tables you actually want | **Yes** — new script per experiment |
 
 They are decoupled by a **task queue folder** on disk (`ANSYS_ANALYZE_QUEUE_PATH`):
@@ -266,23 +294,25 @@ queue_common.write_local_marker(project_dir, task_id, queue.root)
 
 ---
 
-## 4. `ansys_analyze_worker/queue_common.py` — the shared contract
+## 4. `common/ansys_analyze_common/queue_common.py` — the shared contract
 
 `queue_common.py` is a single, dependency-free (stdlib only) module that
 defines the task schema and the queue folder helpers. **Both** Part 1/
-Part 3 scripts (in the experiment repo) and Part 2 (this repo) use it —
-but now there's exactly one copy, living here, imported as a real
-dependency rather than copy-pasted:
+Part 3 scripts (in the experiment repo) and Part 2 (the `worker/`
+package, which depends on `ansys-analyze-common`) use it — but now
+there's exactly one copy, living here, imported as a real dependency
+rather than copy-pasted:
 
 ```python
-from ansys_analyze_worker import queue_common
+from ansys_analyze_common import queue_common
 ```
 
-Because it's an editable install (`pip install -e .` — §0), there's no
-"keep copies in sync" step anymore: change the schema here, and every
-project that depends on this repo sees the change the moment they next
-import it. If you do change the schema, bump `SCHEMA_VERSION` and update
-this doc.
+Because it's an editable install during development (`pip install -e
+common/` — §0), there's no "keep copies in sync" step: change the schema
+here, and every project that depends on it sees the change the moment
+they next import it (immediately for an editable install; on their next
+`pip install --upgrade` otherwise). If you do change the schema, bump
+`SCHEMA_VERSION` and update this doc.
 
 Key functions:
 
@@ -403,11 +433,11 @@ to it via the task file — no handler code changes needed.
 This is the part you'll be writing most often, so here's the full recipe.
 Use `part1_build_model.py` (in an experiment repo, e.g.
 `pedestal_experiment`) as the template — copy it and adjust the
-model-specific bits. It needs this repo installed as a dependency
-(§0) and starts with:
+model-specific bits. It needs `ansys-analyze-common` installed as a
+dependency (§0) and starts with:
 
 ```python
-from ansys_analyze_worker import queue_common
+from ansys_analyze_common import queue_common
 ```
 
 ### 8.1 What Part 1 must do
@@ -476,12 +506,12 @@ exports so this matching logic keeps working without per-file tweaks.
 ## 9. Authoring a Part 3 script
 
 Part 3 doesn't touch AEDT at all — it's pure data wrangling, plotting,
-and queue housekeeping. Same as Part 1, it needs this repo installed as
-a dependency (§0) and starts with `from ansys_analyze_worker import
-queue_common`. It does need the queue mounted, though, since that's
-where results live (§2.1) — it doesn't need `ANSYS_ANALYZE_QUEUE_PATH`
-to be set to the exact same value Part 1/2 used, just to point at the
-same shared location.
+and queue housekeeping. Same as Part 1, it only needs
+`ansys-analyze-common` installed as a dependency (§0) and starts with
+`from ansys_analyze_common import queue_common`. It does need the queue
+mounted, though, since that's where results live (§2.1) — it doesn't
+need `ANSYS_ANALYZE_QUEUE_PATH` to be set to the exact same value
+Part 1/2 used, just to point at the same shared location.
 
 ### Building and merging results
 
@@ -582,12 +612,13 @@ it is eigenmode/pedestal-specific.
 
 ### Files
 
-All under `ansys_analyze_worker/` (this repo's importable package — see §0):
+`queue_common.py` lives in the separate `common/ansys_analyze_common/`
+package (§0/§4) — everything below is under `worker/ansys_analyze_worker/`,
+this repo's second importable package:
 
 | File | Responsibility |
 |---|---|
 | `__init__.py` | Package marker + version. |
-| `queue_common.py` | The shared task/result schema and queue helpers (§4) — also what Part 1/Part 3 import. |
 | `run_service.py` | Entry point. Sets up logging, starts the worker loop on a background thread, starts the tray icon on the main thread, handles the Reset self-restart. |
 | `worker.py` | The generic scan/dispatch/file-away loop described in §6. |
 | `tray_app.py` | The taskbar icon (via `pystray`) — pause/resume, open queue folder, open log, reset, exit. |
@@ -596,20 +627,23 @@ All under `ansys_analyze_worker/` (this repo's importable package — see §0):
 
 ### Import mechanics (why this matters if you add files)
 
-This is a real, installed Python package now (`pip install -e .` — §0),
-so every module inside `ansys_analyze_worker/` uses normal **relative**
-imports (`from .queue_common import ...`, `from .handlers import
-get_handler`, `from ..post_processing import ...` inside `handlers/`).
-That means `run_service.py` can no longer be run as a bare script
-(`python run_service.py`) — relative imports need real package context.
-Always launch it one of these two ways:
+This is a real, installed Python package now (`pip install -e worker/` —
+§0), so most modules inside `ansys_analyze_worker/` use normal
+**relative** imports for their own siblings (`from .handlers import
+get_handler`, `from ..post_processing import ...` inside `handlers/`),
+and an **absolute** import for the schema module, since that now lives
+in the separate `ansys_analyze_common` package this one depends on:
+`from ansys_analyze_common.queue_common import ...`. That means
+`run_service.py` can no longer be run as a bare script (`python
+run_service.py`) — relative imports need real package context. Always
+launch it one of these two ways:
 
 ```
 ansys-analyze-worker                        # the installed console-script
 python -m ansys_analyze_worker.run_service   # equivalent, no console-script needed
 ```
 
-Both work identically; the console-script (defined in `pyproject.toml`'s
+Both work identically; the console-script (defined in `worker/pyproject.toml`'s
 `[project.scripts]`) is just a shortcut for the `-m` form. **Never** run
 `worker.py`, `tray_app.py`, or a handler module directly — same
 "attempted relative import with no known parent package" error you'd get
@@ -766,7 +800,7 @@ whole pipeline against a small batch first.
 | Worker can't connect to AEDT | Make sure the full AEDT session is already open on that machine before starting `run_service.py` — it attaches to an existing session (`new_desktop=False`), it does not launch one. |
 | Eigenmode chain finds suspiciously few / high-frequency-only modes | Check `start_min_freq_ghz` in the task's `parameters` — see §11's companion fix in Part 1, §8's note on `min_freq_safety_factor`. |
 | "attempted relative import with no known parent package" | You ran a module inside `ansys_analyze_worker/` directly instead of via `ansys-analyze-worker` / `python -m ansys_analyze_worker.run_service` — see §10. |
-| `ModuleNotFoundError: No module named 'ansys_analyze_worker'` in a Part 1/Part 3 script | The experiment repo's dependency on this one isn't installed — run `pip install -r requirements.txt` in the experiment repo (§0), and check its `-e path/to/ansys-analyze-worker` line points at the right local path. |
+| `ModuleNotFoundError: No module named 'ansys_analyze_common'` in a Part 1/Part 3 script | The experiment repo's dependency on the common package isn't installed — run `pip install -r requirements.txt` in the experiment repo (§0), and check its `requirements.txt` line points at `...#subdirectory=common` (not `...#subdirectory=worker`, and not a stale local path). |
 | `FileNotFoundError` / "project not found" when Part 2 opens a project | `ANSYS_ANALYZE_QUEUE_PATH` doesn't point at the same physical location on both machines (e.g. different drive letters for the same network share), or Part 1 queued the task before the copy into `projects/<task_id>/` finished — check that Part 1's copy step (§2.1) completed without error before the task file was written. |
 | A local `built_models/...` folder has no `queue_task.json` | Either that build failed before reaching the queuing step, or it's from before this marker mechanism existed — check the script's console output from when it was built. |
 | Part 3 says "No result.json files found" | Nothing has completed yet (check `--check_status`), or `--queue_dir`/`ANSYS_ANALYZE_QUEUE_PATH` points somewhere other than where Part 2 is actually writing. There's no `modes_results.csv` to find directly — Part 3 builds it itself from `result.json` (§5/§9), so an empty `projects/` tree means there's nothing to build from yet, not a Part 3 bug. |

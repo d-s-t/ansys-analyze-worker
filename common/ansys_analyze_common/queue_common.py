@@ -1,12 +1,15 @@
 """
 Shared, dependency-free (stdlib only) helpers for the Ansys analysis task
 queue. Used by BOTH Part 1 (model-building, student version) and Part 2
-(the generic analysis worker, full version) so the task file format can
-never drift between the two sides.
+(the generic analysis worker, full version, in the sibling
+`ansys-analyze-worker` package) so the task file format can never drift
+between the two sides.
 
-Copy this file alongside every Part 1 / Part 3 script you write, and keep
-the copy next to part2_worker/ in sync with it. See docs/ARCHITECTURE.md
-for the full schema reference.
+This lives in its own installable package, `ansys-analyze-common`, so a
+Part 1/Part 3 project can depend on just this file's contents without
+pulling in the AEDT/tray-icon/plotting libraries that only the worker
+package needs. See docs/ARCHITECTURE.md (in the `ansys-analyze-worker`
+repo) for the full schema reference and install instructions.
 """
 from __future__ import annotations
 
