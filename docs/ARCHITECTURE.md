@@ -1,9 +1,9 @@
 # ansys-analyze-worker — Architecture & Authoring Guide
 
 This document explains how the pipeline fits together and, most importantly,
-how to write new **Part 1** and **Part 3** scripts for future experiments.
-Part 2 (the background worker, this repo) is meant to stay generic and
-should not need to change when you add a new design or solution type.
+how to write a **client pipeline** for future experiments. The worker
+(this repo) is meant to stay generic and should not need to change when
+you add a new design or solution type.
 
 ---
 
@@ -17,17 +17,17 @@ the one it actually needs instead of pulling in the other's dependencies
 | Package | Subdirectory | Contains | Depends on |
 |---|---|---|---|
 | `ansys-analyze-common` | `common/` | `queue_common.py` only -- the shared, dependency-free (stdlib only) task/result schema. | nothing |
-| `ansys-analyze-worker` | `worker/` | Part 2 itself: `run_service.py`, `worker.py`, `tray_app.py`, `post_processing.py`, `handlers/`. | `ansys-analyze-common`, `pyaedt`, `pandas`, `matplotlib`, `pystray`, `Pillow` |
+| `ansys-analyze-worker` | `worker/` | The worker itself: `run_service.py`, `worker.py`, `tray_app.py`, `post_processing.py`, `handlers/`. | `ansys-analyze-common`, `pyaedt`, `pandas`, `matplotlib`, `pystray`, `Pillow` |
 
 Not published to PyPI -- install straight from GitHub, using pip's
 `#subdirectory=` fragment to pick which of the two you want:
 
 ```
-# On the AEDT machine (Part 2 itself):
+# On the AEDT machine (the worker itself):
 pip install "git+https://github.com/d-s-t/ansys-analyze-worker.git#subdirectory=worker"
 
-# In an experiment repo (Part 1/Part 3 scripts) -- just the schema, none
-# of the worker's files or dependencies:
+# In a client pipeline repo -- just the schema, none of the worker's
+# files or dependencies:
 pip install "git+https://github.com/d-s-t/ansys-analyze-worker.git#subdirectory=common"
 ```
 
@@ -36,8 +36,9 @@ dependency (via the same git URL), so installing the worker package
 alone pulls the common one in automatically -- you never need both lines
 for the worker machine.
 
-Everything experiment-specific — Part 1 and Part 3 scripts — lives in a
-**separate repo per experiment** (e.g. `pedestal_experiment`), which
+The client pipeline -- the project that builds AEDT models, queues them
+for analysis, monitors progress, and plots results -- lives in a
+**separate repo per experiment** (e.g. `microwave-package`), which
 depends on `ansys-analyze-common` via `requirements.txt`:
 
 ```
@@ -62,31 +63,31 @@ pip install -e common/
 pip install -e worker/       # pulls in common/ automatically too
 ```
 
-§8/§9 are written from the point of view of the separate,
-experiment-specific repo; §10 covers this repo's own internals.
+§8 is written from the point of view of the separate, client-pipeline
+repo; §10 covers this repo's own internals.
 
 ---
 
-## 1. The three parts, at a glance
+## 1. The two sides, at a glance
 
-| Part | Lives in | Runs on | License needed | Job | Changes per experiment? |
+| Side | Lives in | Runs on | License needed | Job | Changes per experiment? |
 |---|---|---|---|---|---|
-| **Part 1** | the experiment repo (e.g. `pedestal_experiment`) | Your modeling PC | Student version | Build the geometry, assign materials/boundaries, save the `.aedt` file, and drop a **task file** describing what analysis to run | **Yes** — new script per experiment/design |
-| **Part 2** | **this repo**, `ansys-analyze-worker` (the `worker/` package) | The PC with the full license, AEDT already open | Full version | Sits in the background, watches a queue folder, picks up task files, runs whatever analysis they describe, writes results | **No** — generic engine + a small "handler" module per analysis type |
-| **Part 3** | the experiment repo | Anywhere (just needs the result files) | None (no AEDT needed) | Reads the result files Part 2 produced and turns them into the plots/tables you actually want | **Yes** — new script per experiment |
+| **Client pipeline** | a separate experiment repo (e.g. `microwave-package`) | Your modeling PC (and anywhere you check on progress or view plots) | Student version for building geometry; none for monitoring/plotting | Build the geometry, assign materials/boundaries, queue an analysis task per model, wait for and monitor results, then plot them | **Yes** -- new/adjusted script per experiment/design |
+| **Worker** | **this repo**, `ansys-analyze-worker` (the `worker/` package) | The PC with the full license, AEDT already open | Full version | Sits in the background, watches a queue folder, picks up task files, runs whatever analysis they describe, writes results | **No** -- generic engine + a small "handler" module per analysis type |
 
 They are decoupled by a **task queue folder** on disk (`ANSYS_ANALYZE_QUEUE_PATH`):
 
 ```
-Part 1 (student AEDT)          Part 2 (full AEDT, background service)      Part 3
-   builds model         -->        watches queue, runs analysis      -->   reads results
-   writes task.json               writes result.json + images              makes plots
+Client pipeline (student AEDT)      Worker (full AEDT, background service)
+   builds model, queues task  -->     watches queue, runs analysis
+   monitors + plots results   <--     writes result.json + images
 ```
 
-Part 1 and Part 2 can run on the **same machine** or **different machines**.
-If they're on different machines, `ANSYS_ANALYZE_QUEUE_PATH` needs to point
-to a location both machines can see (e.g. a shared/network drive) — see
-§10 for the details and the one thing this implies for file paths.
+The client pipeline and the worker can run on the **same machine** or
+**different machines**. If they're on different machines,
+`ANSYS_ANALYZE_QUEUE_PATH` needs to point to a location both machines can
+see (e.g. a shared/network drive) — see §10 for the details and the one
+thing this implies for file paths.
 
 ---
 
@@ -94,22 +95,22 @@ to a location both machines can see (e.g. a shared/network drive) — see
 ## 2. On-disk layout of the queue
 
 `ANSYS_ANALYZE_QUEUE_PATH` (an environment variable — see §10) points at a
-root folder. Both Part 1 and Part 2 need read/write access to it — in the
-common case, Part 1 (modeling) and Part 2 (analysis) run on **different
-machines**, so this needs to be a shared/network location. The worker
-creates and manages these subfolders:
+root folder. Both the client pipeline and the worker need read/write
+access to it — in the common case, they run on **different machines**,
+so this needs to be a shared/network location. The worker creates and
+manages these subfolders:
 
 ```
 <ANSYS_ANALYZE_QUEUE_PATH>/
-├── pending/       Part 1 drops new *.task.json files here
+├── pending/       the client pipeline drops new *.task.json files here
 ├── in_progress/   the worker moves a task here while it's being processed
 ├── done/          successfully completed tasks end up here
 ├── failed/        tasks that raised an error end up here, plus a
 │                   "<name>.task.json.error.log" with the traceback
 ├── projects/      <task_id>/ subfolders -- each one holds the .aedt +
-│                   .aedb project bundle Part 1 built AND everything
-│                   Part 2 produces for that task (result.json, field-
-│                   plot images, ...) -- see §2.1
+│                   .aedb project bundle the client pipeline built AND
+│                   everything the worker produces for that task
+│                   (result.json, field-plot images, ...) -- see §2.1
 └── _logs/         the worker's own log file
 ```
 
@@ -126,10 +127,10 @@ into `pending/`.
 
 ### 2.1 Why project files live *inside* the queue, and nowhere else
 
-Early on it's tempting to have the task JSON just point at wherever Part 1
-happened to save the `.aedt` file locally, and have Part 2 write results
-back to some other local `analyzed/` folder. **That breaks the moment
-Part 1 and Part 2 run on different PCs** — a path like
+Early on it's tempting to have the task JSON just point at wherever the
+client pipeline happened to save the `.aedt` file locally, and have the
+worker write results back to some other local `analyzed/` folder. **That
+breaks the moment the two sides run on different PCs** — a path like
 `C:\Users\david\...\built_models\run_003\4mm_pedestal.aedt` only means
 something on the machine that has that `C:\Users\david\...` folder; the
 worker on the other machine can't open it, and even if it somehow could,
@@ -138,11 +139,11 @@ it would have nowhere valid to write results back to either.
 The fix used throughout this pipeline: **the queue folder is the only
 location guaranteed to be reachable from both sides**, so:
 
-- Part 1 **copies** the entire built project (`.aedt` file *and* its
-  `.aedb` companion folder — the `.aedt` file alone isn't a complete,
-  openable project) into `queue/projects/<task_id>/` before it ever
-  writes the task file. See `queue_common.copy_project_to_queue()`.
-- Part 2 writes everything it produces — `result.json`, field-plot
+- The client pipeline **copies** the entire built project (`.aedt` file
+  *and* its `.aedb` companion folder — the `.aedt` file alone isn't a
+  complete, openable project) into `queue/projects/<task_id>/` before it
+  ever writes the task file. See `queue_common.copy_project_to_queue()`.
+- The worker writes everything it produces — `result.json`, field-plot
   images, the per-mode subfolders — back into that **same**
   `queue/projects/<task_id>/` folder, in place. There is deliberately no
   separate `results/` tree: an earlier version of this pipeline had one,
@@ -156,11 +157,11 @@ location guaranteed to be reachable from both sides**, so:
   `"projects/eigenmode_chain_20260813_.../"`), which either machine can
   turn into a real path with `queue_common.resolve_path(queue, path)`.
 
-If you ever *do* run Part 1 and Part 2 on the same machine and want to
-skip the copy step, `build_task()` will also accept absolute paths —
+If you ever *do* run both sides on the same machine and want to skip the
+copy step, `build_task()` will also accept absolute paths —
 `resolve_path()` leaves anything already absolute untouched. That's the
-exception, though; the default (and what `part1_build_model.py` does) is
-always to copy into the queue and use relative paths.
+exception, though; the default is always to copy into the queue and use
+relative paths.
 
 Because each task gets its own `<task_id>` subfolder under `projects/`,
 and `task_id` already includes a timestamp (`queue_common.new_task_id()`),
@@ -169,21 +170,21 @@ different `0mm_pedestal.aedt`, from two separate batches) colliding.
 
 ### 2.2 Tracing a local folder back to its queued task
 
-Since the project bundle gets copied away from Part 1's local
-`built_models/` folder, that local folder no longer *is* anything Part 2
-looks at directly. To keep it useful for tracing status later, Part 1
-also drops a small `queue_task.json` marker into it (see
-`queue_common.write_local_marker()`), recording the `task_id`. Part 3's
-`--check_status` and `--cleanup` modes (§9) read these markers back to
-find and act on tasks.
+Since the project bundle gets copied away from the client pipeline's
+local build folder, that local folder no longer *is* anything the worker
+looks at directly. To keep it useful for tracing status later, the
+client pipeline also drops a small `queue_task.json` marker into it (see
+`queue_common.write_local_marker()`), recording the `task_id`. A status
+check or monitoring loop (§9) reads these markers back to find and act
+on tasks.
 
 ### 2.3 Cleaning up failed tasks
 
 Failed tasks don't disappear on their own — they sit in `failed/` (plus
 their `queue/projects/<task_id>/` folder and the local `queue_task.json`-
-marked folder) until you deal with them. `part3_plot_results.py
---cleanup` walks your local `built_models/` tree, and for every task it
-finds in the `failed` state, shows the error and asks:
+marked folder) until you deal with them. A cleanup flow in the client
+pipeline can walk your local build folder tree, and for every task it
+finds in the `failed` state, show the error and ask:
 
 ```
 FAILED: pedestal_experiment\built_models\run_003\2mm_pedestal
@@ -194,8 +195,8 @@ FAILED: pedestal_experiment\built_models\run_003\2mm_pedestal
 
 - **Remove** (`queue_common.remove_task()`) deletes `failed/<task_id>
   .task.json` + its `.error.log`, the whole `queue/projects/<task_id>/`
-  folder, AND the local `built_models/...` folder that queued it —
-  cleaning up both sides in one step.
+  folder, AND the local build folder that queued it — cleaning up both
+  sides in one step.
 - **Try again** (`queue_common.retry_task()`) moves the task file back
   into `pending/` and clears the old error log, leaving the project
   bundle in `queue/projects/<task_id>/` exactly as it was. The worker
@@ -207,7 +208,7 @@ FAILED: pedestal_experiment\built_models\run_003\2mm_pedestal
 
 ---
 
-## 3. The task file (what Part 1 writes)
+## 3. The task file (what the client pipeline writes)
 
 Each task is one JSON file, `<task_id>.task.json`, in `pending/`.
 
@@ -217,9 +218,9 @@ Each task is one JSON file, `<task_id>.task.json`, in `pending/`.
 |---|---|---|
 | `schema_version` | int | Always `1` for now. Lets the worker refuse task files from a future/incompatible format instead of guessing. |
 | `task_id` | str | Unique ID. `queue_common.new_task_id()` generates one for you. |
-| `task_type` | str | Which **handler** in Part 2 should process this task (e.g. `"eigenmode_chain"`). This is the whole mechanism that lets Part 2 stay generic — see §6. |
+| `task_type` | str | Which **handler** in the worker should process this task (e.g. `"eigenmode_chain"`). This is the whole mechanism that lets the worker stay generic — see §6. |
 | `project_file` | str | Path to the `.aedt` file, **relative to the queue root** (e.g. `"projects/<task_id>/0mm_pedestal.aedt"`) — see §2.1. Resolve with `queue_common.resolve_path()`. |
-| `output_dir` | str | Path to the folder Part 2 should write everything it produces into, **relative to the queue root** — normally the SAME folder as `project_file`'s directory (e.g. `"projects/<task_id>"`, via `queue_common.project_dir_for_task()`), not a separate location. Same resolution. |
+| `output_dir` | str | Path to the folder the worker should write everything it produces into, **relative to the queue root** — normally the SAME folder as `project_file`'s directory (e.g. `"projects/<task_id>"`, via `queue_common.project_dir_for_task()`), not a separate location. Same resolution. |
 
 ### Optional fields
 
@@ -229,9 +230,9 @@ Each task is one JSON file, `<task_id>.task.json`, in `pending/`.
 | `parameters` | object | Handler-specific analysis parameters (for `eigenmode_chain`: starting frequency, target max frequency, number of modes, pass counts, etc. — see `handlers/eigenmode_chain.py`). |
 | `objects` | object | Logical name → actual AEDT object name, e.g. `{"chip": "chip_1", "vacuum": "vacuum_1"}`. Lets post-processing steps refer to "the chip" without knowing exact import-generated object names. |
 | `post_processing` | list | Which generic post-processing operations to run per result (e.g. field plots) — see §7. |
-| `metadata` | object | Free-form data that has nothing to do with the analysis itself but that Part 3 will want later (e.g. `{"pedestal_depth": 4.0}`). Copied through untouched into the results. |
+| `metadata` | object | Free-form data that has nothing to do with the analysis itself but that the client pipeline will want later (e.g. `{"pedestal_depth": 4.0}`). Copied through untouched into the results. |
 
-### Example (what `part1_build_model.py` writes for one pedestal depth)
+### Example
 
 ```json
 {
@@ -269,9 +270,8 @@ Each task is one JSON file, `<task_id>.task.json`, in `pending/`.
 ```
 
 `queue_common.build_task(...)` builds and validates a dict in exactly this
-shape for you — Part 1 scripts should always go through it rather than
-building the dict by hand. The full sequence a Part 1 script should
-follow (see `part1_build_model.py`'s `build_one()`):
+shape for you — a client pipeline should always go through it rather than
+building the dict by hand. The full sequence to follow:
 
 ```python
 hfss.save_project(project_path)
@@ -297,11 +297,10 @@ queue_common.write_local_marker(project_dir, task_id, queue.root)
 ## 4. `common/ansys_analyze_common/queue_common.py` — the shared contract
 
 `queue_common.py` is a single, dependency-free (stdlib only) module that
-defines the task schema and the queue folder helpers. **Both** Part 1/
-Part 3 scripts (in the experiment repo) and Part 2 (the `worker/`
-package, which depends on `ansys-analyze-common`) use it — but now
-there's exactly one copy, living here, imported as a real dependency
-rather than copy-pasted:
+defines the task schema and the queue folder helpers. **Both** the
+client pipeline and the worker (which depends on `ansys-analyze-common`)
+use it — but now there's exactly one copy, living here, imported as a
+real dependency rather than copy-pasted:
 
 ```python
 from ansys_analyze_common import queue_common
@@ -328,19 +327,19 @@ Key functions:
   compute the queue-relative folder both `project_file` and `output_dir`
   should point at (§2.1).
 - `write_local_marker(...)` / `get_task_status(...)` — the local↔task_id
-  tracing mechanism (§2.2) and status lookup, used by Part 3.
+  tracing mechanism (§2.2) and status lookup.
 - `remove_task(...)` / `retry_task(...)` / `read_error_log(...)` — the
-  cleanup primitives behind `part3_plot_results.py --cleanup` (§2.3).
+  cleanup primitives behind a client pipeline's cleanup flow (§2.3).
 - `recover_orphaned_tasks(queue)` — moves anything stuck in
   `in_progress/` back to `pending/`; called automatically at worker
   startup, including after the tray's "Reset" (§10).
 
 ---
 
-## 5. What Part 2 writes back (the results)
+## 5. What the worker writes back (the results)
 
-For a successful task, Part 2 writes ONE thing into `output_dir` (i.e.
-back into `queue/projects/<task_id>/` itself, once resolved — §2.1):
+For a successful task, the worker writes ONE thing into `output_dir`
+(i.e. back into `queue/projects/<task_id>/` itself, once resolved — §2.1):
 
 - `result.json` — `status: "success"`, `task_id`, `task_type`,
   `metadata` (copied through from the task file unchanged), and a
@@ -352,13 +351,13 @@ back into `queue/projects/<task_id>/` itself, once resolved — §2.1):
 - `<Setup>_Mode_<n>/` subfolders — one per mode, holding whatever images
   and per-mode CSVs the post-processing steps produced.
 
-**Part 2 deliberately does NOT build `modes_results.csv` itself.**
+**The worker deliberately does NOT build `modes_results.csv` itself.**
 Turning the raw `modes` list in `result.json` into a per-task CSV, and
-merging every task's CSV into one combined table, is Part 3's job — see
-§9. This keeps the worker a thin, generic "run the analysis, hand back
-the numbers" service; all the plot-shaping and column decisions live in
-the one script per experiment that actually cares about them, not
-duplicated inside every handler.
+merging every task's CSV into one combined table, is the client
+pipeline's job — see §9. This keeps the worker a thin, generic "run the
+analysis, hand back the numbers" service; all the plot-shaping and
+column decisions live in the one client pipeline that actually cares
+about them, not duplicated inside every handler.
 
 For a **failed** task, `result.json` still gets written (with
 `status: "failed"` and an `error` message) if `output_dir` was resolvable
@@ -367,7 +366,7 @@ the task file in `failed/<task_id>.task.json.error.log` regardless.
 
 ---
 
-## 6. How Part 2 stays generic: the handler registry
+## 6. How the worker stays generic: the handler registry
 
 `ansys_analyze_worker/worker.py` contains **zero** knowledge of eigenmodes,
 pedestals, chips, or anything experiment-specific. All it does is:
@@ -428,35 +427,37 @@ to it via the task file — no handler code changes needed.
 
 ---
 
-## 8. Authoring a Part 1 script
+## 8. Authoring a client pipeline
 
-This is the part you'll be writing most often, so here's the full recipe.
-Use `part1_build_model.py` (in an experiment repo, e.g.
-`pedestal_experiment`) as the template — copy it and adjust the
-model-specific bits. It needs `ansys-analyze-common` installed as a
-dependency (§0) and starts with:
+This is the project you'll be writing/adjusting most often, so here's the
+full recipe. A client pipeline is a single project (e.g.
+`microwave-package`) that, end to end: builds geometry for each point in
+a parameter sweep, queues an analysis task per point, waits for and
+monitors the worker's progress, and plots the combined results once
+they're in. It needs `ansys-analyze-common` installed as a dependency
+(§0) and starts with:
 
 ```python
 from ansys_analyze_common import queue_common
 ```
 
-### 8.1 What Part 1 must do
+### 8.1 What the model-building step must do, per geometry
 
 1. **Launch/attach to AEDT in student mode.** Pass
    `student_version=True` to `Hfss(...)`. This matters even if you only
    have the student version installed, because it tells PyAEDT which
    installation and licensing path to use.
 2. **Build or import the geometry.** Either import a STEP/model file
-   (`hfss.modeler.import_3d_cad(path)`, as in the pedestal script) or
-   build it parametrically with the modeler API.
+   (`hfss.modeler.import_3d_cad(path)`) or build it parametrically with
+   the modeler API.
 3. **Assign materials and boundary conditions.** This is genuinely
    design-specific — write whatever logic identifies your objects (by
    name pattern, by a manifest file, however makes sense for your model)
    and assigns `material_name`, boundaries (`assign_perfect_e`,
    `assign_radiation_boundary`, ports, etc.).
 4. **Do NOT create an analysis setup and do NOT call `analyze_setup` /
-   `analyze`.** That is Part 2's job, and it's the operation that
-   actually needs the full license/compute. Part 1 should only ever
+   `analyze`.** That is the worker's job, and it's the operation that
+   actually needs the full license/compute. This step should only ever
    touch modeling, materials, and boundaries.
 5. **Save and close the project** (`hfss.save_project(project_path)`,
    then `hfss.close_project(...)`) — close it *before* copying, so the
@@ -467,10 +468,10 @@ from ansys_analyze_common import queue_common
    `write_task_atomically`, `write_local_marker`). Compute whatever
    analysis parameters the handler needs first (e.g. a sensible starting
    frequency — see the note in §11 on why this needs care).
-7. Move to the next model. There's no separate "close" step here since
-   the project was already closed in step 5, before the copy.
+7. Move to the next geometry. There's no separate "close" step here
+   since the project was already closed in step 5, before the copy.
 
-### 8.2 Checklist for a new Part 1 script
+### 8.2 Checklist for the model-building step
 
 - [ ] Uses `student_version=True`.
 - [ ] Never calls `create_setup` / `analyze_setup` / `analyze`.
@@ -481,12 +482,12 @@ from ansys_analyze_common import queue_common
       `copy_project_to_queue()`/`project_dir_for_task()` hand back for
       `project_file`/`output_dir` — not local absolute paths, and not two
       different folders (§2.1).
-- [ ] Picks a `task_type` that either matches an existing Part 2 handler,
+- [ ] Picks a `task_type` that either matches an existing worker handler,
       or that you've added a new handler for (§6).
-- [ ] Puts everything Part 2's handler needs into `parameters`, and
+- [ ] Puts everything the handler needs into `parameters`, and
       everything about *this specific object* it might need to
       post-process into `objects`.
-- [ ] Puts everything Part 3 will need to plot/tabulate into `metadata`.
+- [ ] Puts everything the plotting step will need into `metadata`.
 - [ ] Writes the task file **last**, only after the project has been
       copied into the queue successfully — never queue a task for a
       project bundle that isn't actually there yet.
@@ -495,120 +496,87 @@ from ansys_analyze_common import queue_common
 
 ### 8.3 A note on object naming
 
-`assign_materials_and_boundaries` (and the `objects` dict it returns) is
-the bridge between "what Part 1 built" and "what Part 2's post-processing
-needs to find." Keep your object-naming convention (e.g. `chip`,
-`chip_lid`, `box`, `vacuum`, `pcb` substrings) consistent across STEP
-exports so this matching logic keeps working without per-file tweaks.
+The mapping from "what got built" to "what the handler's post-processing
+needs to find" (the `objects` dict passed into `build_task()`) is the
+bridge between the two. Keep your object-naming convention (e.g. `chip`,
+`chip_lid`, `box`, `vacuum`, `pcb` substrings) consistent across imported
+geometry so this matching logic keeps working without per-file tweaks.
 
 ---
 
-## 9. Authoring a Part 3 script
+## 9. Monitoring, plotting, and cleanup
 
-Part 3 doesn't touch AEDT at all — it's pure data wrangling, plotting,
-and queue housekeeping. Same as Part 1, it only needs
-`ansys-analyze-common` installed as a dependency (§0) and starts with
-`from ansys_analyze_common import queue_common`. It does need the queue
-mounted, though, since that's where results live (§2.1) — it doesn't
-need `ANSYS_ANALYZE_QUEUE_PATH` to be set to the exact same value
-Part 1/2 used, just to point at the same shared location.
+Once tasks are queued, the client pipeline needs to wait for and collect
+results -- this part never touches AEDT, it's pure data wrangling,
+plotting, and queue housekeeping. It does need the queue mounted, though,
+since that's where results live (§2.1) — it doesn't need
+`ANSYS_ANALYZE_QUEUE_PATH` to be set to the exact same value the
+model-building step used, just to point at the same shared location.
+
+### Monitoring
+
+Poll `queue_common.get_task_status(queue, task_id)` for each queued
+task_id and report transitions as they happen
+(`pending`/`in_progress`/`done`/`failed`) rather than only at the very
+end -- this is what lets you see progress live instead of just "it's
+done or it isn't" once everything finishes. Treat an unreachable queue
+path (e.g. a dropped network share) as transient: wait and retry rather
+than crashing, so an interrupted run can pick back up once the share is
+back.
 
 ### Building and merging results
 
-Part 2 only ever writes raw mode data into `result.json` (§5) — turning
-that into a CSV, and merging every task's CSV into one table, is Part 3's
-job. `build_and_load_results()` in `part3_plot_results.py` is the
-reference implementation:
+The worker only ever writes raw mode data into `result.json` (§5) —
+turning that into a CSV, and merging every task's CSV into one table, is
+the client pipeline's job:
 
 1. **Glob for `result.json` files** under the queue's `projects/` tree:
    ```python
    queue = queue_common.QueuePaths(queue_root)
    result_json_paths = glob.glob(os.path.join(queue.projects, "*", "result.json"))
    ```
-2. **For each successful one**, build a DataFrame from
+2. **For each successful one**, build a table from
    `summary["result"]["modes"]`, attach every key in
    `summary["metadata"]` (e.g. `pedestal_depth`) as a column, and write
-   it out as `modes_results.csv` **in that same `projects/<task_id>/`
-   folder** — this is the "Part 3 creates the CSV files" step. Skip (and
-   report) tasks whose `result.json` says `status != "success"`, or that
-   have no mode data.
-3. **Concatenate** every per-task DataFrame into one combined table and
-   write it out (e.g. `all_results.csv`) alongside the plot.
-4. **Plot.** `part3_plot_results.py` reproduces the original
-   frequency-vs-depth scatter plot; adapt the plotting code freely for
-   new experiments — this part is entirely yours.
-
-### Selecting which runs to include
-
-Every task's `metadata` carries a `run` number (the same integer as its
-local `built_models/run_<NNN>/` folder — set by `part1_build_model.py`
-via `get_next_run_dir()`). `--runs` filters `build_and_load_results()` by
-it, using `parse_run_selector()`:
-
-| Syntax | Meaning |
-|---|---|
-| `:` (default) | every run |
-| `start:stop:step` | Python list-slice syntax, applied **positionally** over the sorted list of run numbers that actually exist — not over the numbers' values. `-2:` means "the last 2 runs that exist" even if their numbers aren't contiguous (e.g. runs 1, 2, 5 → `-2:` selects 2 and 5); `::2` means "every other run"; any of start/stop/step may be omitted, same as a real Python slice. |
-| `2,5,7` | exactly those run numbers |
-| `4` | exactly that run number |
-
-```
-> python part3_plot_results.py --runs -2:
---runs '-2:' -> runs [2, 3] (available: [1, 2, 3])
-Skipping 2 run(s):
-  - ...\projects\eigenmode_chain_..._1  (excluded by --runs (run=1))
-  - ...\projects\eigenmode_chain_..._2  (excluded by --runs (run=1))
-Combined 4 rows from 2 run(s) into ...\all_results.csv
-```
-
-Tasks with no `run` key in their metadata (e.g. from a `task_type` that
-doesn't set one) are always included when `--runs` is left at its
-default `:`, and always excluded whenever a specific selection is given
-— there's no run number to match against.
+   it out as a per-task CSV **in that same `projects/<task_id>/`
+   folder**. Skip (and report) tasks whose `result.json` says
+   `status != "success"`, or that have no mode data.
+3. **Concatenate** every per-task table into one combined table and
+   write it out alongside the plot.
+4. **Plot.** Adapt the plotting code freely per experiment — this part
+   is entirely yours.
 
 ### Status checking
 
-`part3_plot_results.py --check_status` walks a local `built_models/` tree
-for the `queue_task.json` markers Part 1 left behind (§2.2), and for each
-one calls `queue_common.get_task_status(queue, task_id)` to report
-`pending`/`in_progress`/`done`/`failed`/`unknown` without you needing to
-dig through the queue folders by hand:
-
-```
-> python part3_plot_results.py --check_status --built_models_dir pedestal_experiment\built_models
-...\built_models\run_003\0mm_pedestal   done         eigenmode_chain_20260813_173801_412933
-...\built_models\run_003\2mm_pedestal   in_progress  eigenmode_chain_20260813_173805_009120
-...\built_models\run_003\4mm_pedestal   pending      eigenmode_chain_20260813_173809_552011
-
-Summary: done=1, in_progress=1, pending=1
-```
+Walk a local build-folder tree for the `queue_task.json` markers left
+behind (§2.2), and for each one call
+`queue_common.get_task_status(queue, task_id)` to report
+`pending`/`in_progress`/`done`/`failed`/`unknown` without needing to dig
+through the queue folders by hand.
 
 ### Cleanup
 
-`part3_plot_results.py --cleanup` is the same walk, but for every task
-found in the `failed` state it prints the error and asks
-[R]emove/[T]ry again/[S]kip, using `queue_common.remove_task()` /
-`retry_task()` — see §2.3 for exactly what each option deletes/re-queues.
-Reuse `cleanup_failed_tasks()` as-is in new Part 3 scripts; nothing about
-it is eigenmode/pedestal-specific.
+Same walk, but for every task found in the `failed` state, print the
+error and ask [R]emove/[T]ry again/[S]kip, using
+`queue_common.remove_task()` / `retry_task()` — see §2.3 for exactly
+what each option deletes/re-queues.
 
-### Checklist for a new Part 3 script
+### Checklist
 
 - [ ] Reads `result.json` from `queue.projects` (via `QueuePaths`), never
       touches AEDT.
 - [ ] Builds its own per-task CSV(s) from the raw `result.json` data —
-      don't expect Part 2 to have already produced one.
-- [ ] Handles the case where some runs failed (missing/partial data)
+      don't expect the worker to have already produced one.
+- [ ] Handles the case where some tasks failed (missing/partial data)
       without crashing the whole plot.
 - [ ] Saves a combined CSV alongside the plot(s) so you can re-plot later
       without re-reading every individual result.
-- [ ] Reuses `check_status()`/`cleanup_failed_tasks()` (or copies the
-      pattern) if a status report or cleanup flow is useful for the new
-      experiment too.
+- [ ] Treats a temporarily-unreachable queue path as something to wait
+      out, not a fatal error, so an interrupted run can resume.
 
 ---
 
-## 10. Part 2 internals reference (for maintenance)
+## 10. Worker internals reference (for maintenance)
 
 ### Files
 
@@ -653,7 +621,7 @@ running any submodule of any package directly.
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `ANSYS_ANALYZE_QUEUE_PATH` | Yes | Root folder for the task queue (§2). Must be reachable — read/write — from every machine involved (Part 1's, Part 2's, and whatever runs Part 3). In the common two-machine setup this needs to be a shared/network path. Because project bundles and results both live *inside* this folder (§2.1), you don't need any other shared location — just this one. |
+| `ANSYS_ANALYZE_QUEUE_PATH` | Yes | Root folder for the task queue (§2). Must be reachable — read/write — from every machine involved. In the common two-machine setup this needs to be a shared/network path. Because project bundles and results both live *inside* this folder (§2.1), you don't need any other shared location — just this one. |
 
 ### Command-line options
 
@@ -755,17 +723,17 @@ revisit.
 used to pull the actual number out of the returned `SolutionData` object
 has changed between PyAEDT releases -- older versions expose
 `SolutionData.data_real()` (optionally taking the expression name),
-while the version this pipeline is pinned to (`requirements.txt`,
-`pyaedt==1.0.0`) uses `get_expression_data(expression, formula="real")`
-instead, which also returns a different shape (an `(x, y)` array pair
-rather than a flat list). Calling the wrong one raises
-`AttributeError: 'SolutionData' object has no attribute 'data_real'` (or
-the reverse, on an older install). `eigenmode_chain.py`'s
-`_get_real_values(data, expression)` helper checks what the object
-actually exposes at runtime and adapts, so the handler works whichever of
-the two APIs the installed PyAEDT version has -- if you hit this
-`AttributeError` again on a future PyAEDT upgrade, that helper is the one
-place to extend rather than patching call sites throughout the handler.
+while the version this pipeline is pinned to (`pyaedt==1.0.0`) uses
+`get_expression_data(expression, formula="real")` instead, which also
+returns a different shape (an `(x, y)` array pair rather than a flat
+list). Calling the wrong one raises `AttributeError: 'SolutionData'
+object has no attribute 'data_real'` (or the reverse, on an older
+install). `eigenmode_chain.py`'s `_get_real_values(data, expression)`
+helper checks what the object actually exposes at runtime and adapts, so
+the handler works whichever of the two APIs the installed PyAEDT version
+has -- if you hit this `AttributeError` again on a future PyAEDT
+upgrade, that helper is the one place to extend rather than patching
+call sites throughout the handler.
 
 ---
 
@@ -775,14 +743,15 @@ Roughly: the **student version can build and save models** (import
 geometry, assign materials, define boundaries) but is limited on solving
 (reduced problem-size limits, and it's a separate license pool from the
 full/commercial one your organization has for the heavy compute). That's
-the reasoning behind the Part 1/Part 2 split — put everything that needs
-compute (`create_setup`, `analyze_setup`, and by extension all the
-post-processing that depends on a solved setup) behind the full-license
-worker, and keep the student-license machine doing pure modeling.
+the reasoning behind the client-pipeline/worker split — put everything
+that needs compute (`create_setup`, `analyze_setup`, and by extension all
+the post-processing that depends on a solved setup) behind the
+full-license worker, and keep the student-license machine doing pure
+modeling.
 
 ### A note on the PyAEDT version
 
-`requirements.txt` pins `pyaedt==1.0.0` deliberately -- this is the
+The worker's dependencies pin `pyaedt==1.0.0` deliberately -- this is the
 confirmed-working version for both machines. A newer PyAEDT release has
 already been observed to break the `SolutionData` API this pipeline
 relies on (§11's `_get_real_values` note), so don't
@@ -795,14 +764,14 @@ whole pipeline against a small batch first.
 
 | Symptom | Likely cause |
 |---|---|
-| Task sits in `pending/` forever | Part 2 isn't running, or is paused (check the tray icon), or `ANSYS_ANALYZE_QUEUE_PATH` differs between the two machines/processes. |
+| Task sits in `pending/` forever | The worker isn't running, or is paused (check the tray icon), or `ANSYS_ANALYZE_QUEUE_PATH` differs between the two machines/processes. |
 | Task appears in `failed/` immediately | Check `<task>.task.json.error.log` next to it — usually a bad `project_file` path or a `task_type` with no registered handler. |
 | Worker can't connect to AEDT | Make sure the full AEDT session is already open on that machine before starting `run_service.py` — it attaches to an existing session (`new_desktop=False`), it does not launch one. |
-| Eigenmode chain finds suspiciously few / high-frequency-only modes | Check `start_min_freq_ghz` in the task's `parameters` — see §11's companion fix in Part 1, §8's note on `min_freq_safety_factor`. |
+| Eigenmode chain finds suspiciously few / high-frequency-only modes | Check `start_min_freq_ghz` in the task's `parameters` — see §11's companion note on picking a safe starting frequency. |
 | "attempted relative import with no known parent package" | You ran a module inside `ansys_analyze_worker/` directly instead of via `ansys-analyze-worker` / `python -m ansys_analyze_worker.run_service` — see §10. |
-| `ModuleNotFoundError: No module named 'ansys_analyze_common'` in a Part 1/Part 3 script | The experiment repo's dependency on the common package isn't installed — run `pip install -r requirements.txt` in the experiment repo (§0), and check its `requirements.txt` line points at `...#subdirectory=common` (not `...#subdirectory=worker`, and not a stale local path). |
-| `FileNotFoundError` / "project not found" when Part 2 opens a project | `ANSYS_ANALYZE_QUEUE_PATH` doesn't point at the same physical location on both machines (e.g. different drive letters for the same network share), or Part 1 queued the task before the copy into `projects/<task_id>/` finished — check that Part 1's copy step (§2.1) completed without error before the task file was written. |
-| A local `built_models/...` folder has no `queue_task.json` | Either that build failed before reaching the queuing step, or it's from before this marker mechanism existed — check the script's console output from when it was built. |
-| Part 3 says "No result.json files found" | Nothing has completed yet (check `--check_status`), or `--queue_dir`/`ANSYS_ANALYZE_QUEUE_PATH` points somewhere other than where Part 2 is actually writing. There's no `modes_results.csv` to find directly — Part 3 builds it itself from `result.json` (§5/§9), so an empty `projects/` tree means there's nothing to build from yet, not a Part 3 bug. |
-| A task stays in `failed/` after you thought you fixed the problem | `--cleanup`'s "Try again" only re-queues the task file; it doesn't re-copy the project from Part 1's machine. If the fix required changing the model itself, remove the failed task and re-run Part 1 for that model instead of retrying. |
-| Cleanup's "Remove" didn't delete the local folder | It only deletes what the `queue_task.json` marker's containing folder points at — if you moved or renamed the local `built_models/...` folder after building, `remove_task()` deletes the queue side but can't find the (now-elsewhere) local folder. |
+| `ModuleNotFoundError: No module named 'ansys_analyze_common'` in a client pipeline | The client repo's dependency on the common package isn't installed — run `pip install -r requirements.txt` in that repo (§0), and check its `requirements.txt` line points at `...#subdirectory=common` (not `...#subdirectory=worker`, and not a stale local path). |
+| `FileNotFoundError` / "project not found" when the worker opens a project | `ANSYS_ANALYZE_QUEUE_PATH` doesn't point at the same physical location on both machines (e.g. different drive letters for the same network share), or the client pipeline queued the task before the copy into `projects/<task_id>/` finished — check that the copy step (§2.1) completed without error before the task file was written. |
+| A local build folder has no `queue_task.json` | Either that build failed before reaching the queuing step, or it's from before this marker mechanism existed — check the client pipeline's console output from when it was built. |
+| The client pipeline says "No result.json files found" | Nothing has completed yet (check a status report), or the queue path points somewhere other than where the worker is actually writing. There's no per-task CSV to find directly — the client pipeline builds it itself from `result.json` (§5/§9), so an empty `projects/` tree means there's nothing to build from yet, not a bug. |
+| A task stays in `failed/` after you thought you fixed the problem | A cleanup flow's "Try again" only re-queues the task file; it doesn't re-copy the project. If the fix required changing the model itself, remove the failed task and rebuild+requeue that model instead of retrying. |
+| Cleanup's "Remove" didn't delete the local folder | It only deletes what the `queue_task.json` marker's containing folder points at — if you moved or renamed the local build folder after building, `remove_task()` deletes the queue side but can't find the (now-elsewhere) local folder. |
