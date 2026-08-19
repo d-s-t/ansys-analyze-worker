@@ -4,14 +4,15 @@ ansys_analyze_common
 
 The shared, dependency-free (stdlib only) task/result queue schema for
 the ansys-analyze-worker pipeline -- see `queue_common` for the actual
-implementation. Any "Part 1" (model-building) or "Part 3" (results-
-consuming) project depends on this package (NOT on `ansys-analyze-worker`
-itself, which pulls in AEDT/plotting/tray-icon libraries it never needs)
-to talk to the worker's task queue.
+implementation. A client pipeline (the project that builds AEDT models,
+queues them for analysis, monitors progress, and plots results) depends
+on this package -- NOT on `ansys-analyze-worker` itself, which pulls in
+AEDT/plotting/tray-icon libraries it never needs -- to talk to the
+worker's task queue.
 
 See docs/ARCHITECTURE.md in the `ansys-analyze-worker` repo for the full
-design doc, task/result JSON schema, and a guide to writing new Part 1/
-Part 3 scripts.
+design doc, task/result JSON schema, and a guide to writing a client
+pipeline.
 
 Typical usage from a separate, dependent project (after
 `pip install git+https://github.com/d-s-t/ansys-analyze-worker.git#subdirectory=common`):
