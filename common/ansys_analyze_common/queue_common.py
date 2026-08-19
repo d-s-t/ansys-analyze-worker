@@ -1,12 +1,12 @@
 """
 Shared, dependency-free (stdlib only) helpers for the Ansys analysis task
-queue. Used by BOTH Part 1 (model-building, student version) and Part 2
-(the generic analysis worker, full version, in the sibling
-`ansys-analyze-worker` package) so the task file format can never drift
-between the two sides.
+queue. Used by BOTH the client pipeline (model-building, student AEDT
+version) and the worker (the generic analysis service, full AEDT
+version, in the sibling `ansys-analyze-worker` package) so the task file
+format can never drift between the two sides.
 
 This lives in its own installable package, `ansys-analyze-common`, so a
-Part 1/Part 3 project can depend on just this file's contents without
+client pipeline project can depend on just this file's contents without
 pulling in the AEDT/tray-icon/plotting libraries that only the worker
 package needs. See docs/ARCHITECTURE.md (in the `ansys-analyze-worker`
 repo) for the full schema reference and install instructions.
@@ -72,7 +72,7 @@ def build_task(
     metadata: Optional[Dict[str, Any]] = None,
     task_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Convenience builder used by Part 1 scripts to assemble a valid task dict.
+    """Convenience builder used by the client pipeline to assemble a valid task dict.
 
     Always prefer this over hand-building the dict -- it fills in
     schema_version/created_at/task_id consistently and validates the
@@ -80,11 +80,11 @@ def build_task(
 
     `project_file` and `output_dir` are stored EXACTLY as given -- pass
     paths that are relative to the queue root (the normal case, see
-    copy_project_to_queue() below) if Part 1 and Part 2 run on different
-    machines, since an absolute path from one machine is meaningless on
-    the other. Pass absolute paths only if both parts genuinely share the
-    same filesystem. Either way, resolve_path() is what turns whatever is
-    stored here back into a real, openable path.
+    copy_project_to_queue() below) if the client pipeline and the worker
+    run on different machines, since an absolute path from one machine is
+    meaningless on the other. Pass absolute paths only if both sides
+    genuinely share the same filesystem. Either way, resolve_path() is
+    what turns whatever is stored here back into a real, openable path.
     """
     task = {
         "schema_version": SCHEMA_VERSION,
@@ -108,19 +108,20 @@ class QueuePaths:
     On-disk layout under ANSYS_ANALYZE_QUEUE_PATH:
 
         <root>/
-            pending/       Part 1 drops new *.task.json files here
+            pending/       the client pipeline drops new *.task.json files here
             in_progress/   the worker moves a task here while processing it
             done/          successfully completed tasks end up here
             failed/        tasks that raised an error end up here
                            (+ "<name>.task.json.error.log")
             projects/      <task_id>/ subfolders -- each one holds the
-                           .aedt/.aedb project bundle Part 1 queued AND
-                           everything Part 2 produces for that task
-                           (result.json, field-plot images, ...). There is
-                           deliberately no separate "results/" tree: Part 2
-                           updates files in place inside the same
-                           projects/<task_id>/ folder rather than copying
-                           anything to a second location.
+                           .aedt/.aedb project bundle the client pipeline
+                           queued AND everything the worker produces for
+                           that task (result.json, field-plot images,
+                           ...). There is deliberately no separate
+                           "results/" tree: the worker updates files in
+                           place inside the same projects/<task_id>/
+                           folder rather than copying anything to a
+                           second location.
             _logs/         the worker's own log file
 
     ANSYS_ANALYZE_QUEUE_PATH itself must be a location BOTH the modeling
@@ -170,8 +171,8 @@ def resolve_path(queue: "QueuePaths", path: str) -> str:
     Turn a project_file/output_dir value from a task JSON into a real,
     openable absolute path.
 
-    - If it's already absolute, it's used as-is (the "Part 1 and Part 2
-      share a filesystem" case).
+    - If it's already absolute, it's used as-is (the "client pipeline and
+      worker share a filesystem" case).
     - Otherwise it's treated as relative to the queue root (the normal,
       cross-machine case) -- e.g. "projects/<task_id>/0mm_pedestal.aedt"
       resolves to "<queue_root>/projects/<task_id>/0mm_pedestal.aedt",
@@ -187,7 +188,7 @@ def copy_project_to_queue(queue: "QueuePaths", task_id: str, local_project_dir: 
     openable project) into the shared queue, under a task_id-named
     subfolder so concurrent/repeated runs never collide even if they
     share a base filename like "0mm_pedestal". This same folder is where
-    Part 2 will write everything it produces for the task too -- see
+    the worker will write everything it produces for the task too -- see
     project_dir_for_task().
 
     Returns the path to the copied .aedt file, RELATIVE to the queue
@@ -214,9 +215,9 @@ def copy_project_to_queue(queue: "QueuePaths", task_id: str, local_project_dir: 
 def project_dir_for_task(task_id: str) -> str:
     """
     The standard, queue-root-relative folder for a task -- both its copied
-    project bundle AND everything Part 2 produces for it. Use this for
-    `output_dir` when building the task so Part 2 updates files in place
-    rather than writing to a second, separate location.
+    project bundle AND everything the worker produces for it. Use this
+    for `output_dir` when building the task so the worker updates files
+    in place rather than writing to a second, separate location.
     """
     return os.path.join("projects", task_id)
 
@@ -224,11 +225,11 @@ def project_dir_for_task(task_id: str) -> str:
 def write_local_marker(local_project_dir: str, task_id: str, queue_root: str, extra: Optional[Dict[str, Any]] = None) -> str:
     """
     Drop a small `queue_task.json` marker file into the LOCAL run folder
-    Part 1 built the model in, recording which queued task it turned
-    into. This is what lets you (or Part 3's status check) look at a
-    local built_models/... folder later and know exactly which task_id
-    to look for in the queue's pending/in_progress/done/failed folders
-    and results/ tree.
+    the client pipeline built the model in, recording which queued task
+    it turned into. This is what lets you (or a status check) look at a
+    local built-model folder later and know exactly which task_id to look
+    for in the queue's pending/in_progress/done/failed folders and
+    results tree.
     """
     marker = {
         "task_id": task_id,
@@ -275,9 +276,9 @@ def read_error_log(queue: "QueuePaths", task_id: str) -> Optional[str]:
 def remove_task(queue: "QueuePaths", task_id: str, local_project_dir: Optional[str] = None) -> None:
     """
     Delete a task's failed/*.task.json + error log, its whole
-    queue/projects/<task_id>/ folder, and (if given) the local
-    built_models/... folder that queued it. Used by Part 3's --cleanup
-    mode ("remove") -- see docs/ARCHITECTURE.md section 2.2/9.
+    queue/projects/<task_id>/ folder, and (if given) the local build
+    folder that queued it. Used by cleanup flows in a client pipeline --
+    see docs/ARCHITECTURE.md section 2.3.
     """
     import shutil
 
