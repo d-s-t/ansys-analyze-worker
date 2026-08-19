@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ansys-analyze-worker"
+version = "0.1.0"
+description = "Generic background worker that watches a task queue and runs Ansys Electronics Desktop analyses"
+requires-python = ">=3.9"
+dependencies = [
+    # Not on PyPI -- installed straight from the sibling common/ package
+    # in this same repo. See docs/ARCHITECTURE.md section 0. Pin this to
+    # the same @<ref> as the worker install itself once tagging releases.
+    "ansys-analyze-common @ git+https://github.com/d-s-t/ansys-analyze-worker.git#subdirectory=common",
+    # Pinned deliberately -- see docs/ARCHITECTURE.md section 12.
+    "pyaedt==1.0.0",
+    "pandas",
+    "matplotlib",
+    "pystray",
+    "Pillow",
+]
+
+[project.scripts]
+# After `pip install .` (or an editable install), this makes
+# `ansys-analyze-worker` runnable from anywhere, equivalent to
+# `python -m ansys_analyze_worker.run_service`.
+ansys-analyze-worker = "ansys_analyze_worker.run_service:main"
+
+[tool.setuptools.packages.find]
+include = ["ansys_analyze_worker*"]
