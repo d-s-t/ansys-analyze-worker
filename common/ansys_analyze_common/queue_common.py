@@ -66,6 +66,7 @@ def build_task(
     output_dir: str,
     *,
     design_name: Optional[str] = None,
+    solution_type: Optional[str] = None,
     parameters: Optional[Dict[str, Any]] = None,
     objects: Optional[Dict[str, str]] = None,
     post_processing: Optional[List[Dict[str, Any]]] = None,
@@ -85,6 +86,15 @@ def build_task(
     meaningless on the other. Pass absolute paths only if both sides
     genuinely share the same filesystem. Either way, resolve_path() is
     what turns whatever is stored here back into a real, openable path.
+
+    `solution_type` (e.g. "Eigenmode") should be set whenever the client
+    pipeline already knows it -- it built the project with that solution
+    type, after all. The worker passes it straight through when opening
+    the project, which lets PyAEDT skip auto-detecting it via a
+    `GetSolutionType()` round-trip to the AEDT session. That round-trip
+    is worth avoiding: it's an extra point of failure, and at least one
+    PyAEDT version has a bug in its own fallback path when that call
+    fails, masking the real error behind an unrelated AttributeError.
     """
     task = {
         "schema_version": SCHEMA_VERSION,
@@ -93,6 +103,7 @@ def build_task(
         "created_at": _dt.datetime.now().isoformat(timespec="seconds"),
         "project_file": project_file,
         "design_name": design_name,
+        "solution_type": solution_type,
         "output_dir": output_dir,
         "parameters": parameters or {},
         "objects": objects or {},
@@ -227,9 +238,9 @@ def write_local_marker(local_project_dir: str, task_id: str, queue_root: str, ex
     Drop a small `queue_task.json` marker file into the LOCAL run folder
     the client pipeline built the model in, recording which queued task
     it turned into. This is what lets you (or a status check) look at a
-    local built-model folder later and know exactly which task_id to look
-    for in the queue's pending/in_progress/done/failed folders and
-    results tree.
+    local build folder later and know exactly which task_id to look for
+    in the queue's pending/in_progress/done/failed folders and results
+    tree.
     """
     marker = {
         "task_id": task_id,
