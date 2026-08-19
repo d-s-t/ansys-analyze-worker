@@ -142,7 +142,7 @@ class Worker:
             validate_task(task)
 
             # project_file/output_dir are normally relative to the queue
-            # root (Part 1 copies the project bundle into
+            # root (the client pipeline copies the project bundle into
             # queue/projects/<task_id>/, since it usually runs on a
             # different machine than this worker). Resolve them to real
             # absolute paths ONCE here, so every handler and post-
