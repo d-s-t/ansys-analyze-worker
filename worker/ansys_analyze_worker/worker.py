@@ -172,6 +172,12 @@ class Worker:
         kwargs = dict(project=task["project_file"], new_desktop=False)
         if task.get("design_name"):
             kwargs["design"] = task["design_name"]
+        if task.get("solution_type"):
+            # Passing this explicitly lets PyAEDT skip auto-detecting
+            # the solution type via a GetSolutionType() round-trip to
+            # the AEDT session -- see queue_common.build_task()'s
+            # docstring for why that round-trip is worth avoiding.
+            kwargs["solution_type"] = task["solution_type"]
         return Hfss(**kwargs)
 
     def _close_project(self, hfss) -> None:
