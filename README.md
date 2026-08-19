@@ -7,23 +7,30 @@ project uses to talk to it. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 for the full design doc, task/result JSON schema, and a guide to writing
 new Part 1/Part 3 scripts against this package.
 
+This repo holds **two separate installable packages**, in two
+subdirectories, so a client project can depend on just the lightweight
+one it actually needs:
+
+| Package | Subdirectory | Contains | Needs |
+|---|---|---|---|
+| `ansys-analyze-common` | `common/` | `queue_common.py` only -- the shared, dependency-free (stdlib only) task/result schema. | nothing |
+| `ansys-analyze-worker` | `worker/` | Part 2 itself: the background service, tray app, post-processing, handlers. | `ansys-analyze-common`, `pyaedt`, `pandas`, `matplotlib`, `pystray`, `Pillow` |
+
 ## Install
 
-This package is not published to PyPI. Install it straight from GitHub
-with `pip`, in whichever of the two forms below matches the machine.
+Not published to PyPI -- install straight from GitHub with `pip`, using
+the `#subdirectory=` fragment to pick which package you want.
 
 ### On the AEDT machine (the worker itself)
 
-Pull in the `server` extra too -- it's what brings in `pyaedt`, `pystray`,
-`Pillow`, `pandas`, and `matplotlib`, none of which a client project needs
-(see below):
-
 ```
-pip install "ansys-analyze-worker[server] @ git+https://github.com/d-s-t/ansys-analyze-worker.git"
+pip install "git+https://github.com/d-s-t/ansys-analyze-worker.git#subdirectory=worker"
 ```
 
-This makes `from ansys_analyze_worker import queue_common` importable
-from any other project on the machine, and installs the
+`worker/pyproject.toml` declares `ansys-analyze-common` as a dependency
+(via the same repo), so this pulls that in automatically along with
+`pyaedt`/`pandas`/`matplotlib`/`pystray`/`Pillow`. This makes
+`from ansys_analyze_worker import worker` importable and installs the
 `ansys-analyze-worker` console command.
 
 For local development instead (edits to files in this repo take effect
@@ -31,17 +38,18 @@ immediately, no reinstall needed -- pairs well with the tray app's
 "Reset" option, see below):
 
 ```
-pip install -e ".[server]"
+pip install -e common/
+pip install -e worker/
 ```
 
 ### On a client machine/project (Part 1 or Part 3 scripts)
 
-A client only ever needs `ansys_analyze_worker.queue_common`, which is
+A client only ever needs `ansys_analyze_common.queue_common`, which is
 pure stdlib -- no need to drag in AEDT or plotting libraries it never
-imports. Install the base package, no extra:
+imports. Install just the `common/` package:
 
 ```
-pip install git+https://github.com/d-s-t/ansys-analyze-worker.git
+pip install "git+https://github.com/d-s-t/ansys-analyze-worker.git#subdirectory=common"
 ```
 
 or add that same line to the client project's `requirements.txt` (see
@@ -49,18 +57,22 @@ e.g. `microwave-package`'s `requirements.txt`).
 
 ### Pinning a specific version
 
-Once this repo has tagged releases, pin to one by appending `@<ref>`
-(a tag, branch, or commit SHA) to the URL, e.g.:
+Once this repo has tagged releases, pin to one by adding `@<ref>` (a
+tag, branch, or commit SHA) right before the `#subdirectory=...`
+fragment, e.g.:
 
 ```
-pip install "ansys-analyze-worker[server] @ git+https://github.com/d-s-t/ansys-analyze-worker.git@v0.1.0"
-pip install git+https://github.com/d-s-t/ansys-analyze-worker.git@v0.1.0
+pip install "git+https://github.com/d-s-t/ansys-analyze-worker.git@v0.1.0#subdirectory=worker"
+pip install "git+https://github.com/d-s-t/ansys-analyze-worker.git@v0.1.0#subdirectory=common"
 ```
 
 Omitting `@<ref>` (as in the commands above) tracks the default branch,
 which is convenient while this is still moving fast but means `pip
 install --upgrade` can pick up breaking changes -- pin once things
 stabilize. To cut a release to pin to: `git tag v0.1.0 && git push --tags`.
+If you pin `worker`'s version this way, also update the
+`ansys-analyze-common` dependency URL in `worker/pyproject.toml` to the
+same `@<ref>` so the two stay in lockstep.
 
 ## Run
 
@@ -81,8 +93,8 @@ icon (bottom-right of the Windows taskbar) with:
 - **Reset (reload code)** -- restarts the service process so any edits
   made to files in this repo since it started take effect. Doesn't wait
   for an in-flight task to finish; see `Worker.request_restart()`'s
-  docstring in `ansys_analyze_worker/worker.py` for exactly what happens
-  to one if it's mid-analysis when you click this.
+  docstring in `worker/ansys_analyze_worker/worker.py` for exactly what
+  happens to one if it's mid-analysis when you click this.
 - **Exit**
 
 Run with `--no-tray` for a plain console service instead (useful for
@@ -91,8 +103,8 @@ debugging, or running under a service manager that doesn't want a GUI).
 ## Extending
 
 To support a new solution type or design, add a module to
-`ansys_analyze_worker/handlers/` and register it in
-`ansys_analyze_worker/handlers/__init__.py` -- see
+`worker/ansys_analyze_worker/handlers/` and register it in
+`worker/ansys_analyze_worker/handlers/__init__.py` -- see
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) section 6. Nothing else in
 the worker needs to change.
 
@@ -103,11 +115,11 @@ full guide to authoring Part 1/Part 3 scripts. In short, in the other
 project's `requirements.txt`:
 
 ```
-git+https://github.com/d-s-t/ansys-analyze-worker.git
+git+https://github.com/d-s-t/ansys-analyze-worker.git#subdirectory=common
 ```
 
 and then:
 
 ```python
-from ansys_analyze_worker import queue_common
+from ansys_analyze_common import queue_common
 ```
