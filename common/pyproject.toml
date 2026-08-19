@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ansys-analyze-common"
+version = "0.1.0"
+description = "Shared, dependency-free task/result queue schema for the ansys-analyze-worker pipeline"
+requires-python = ">=3.9"
+# Deliberately dependency-free (stdlib only) -- this is the whole point
+# of splitting it out from the worker package. See docs/ARCHITECTURE.md
+# section 0.
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["ansys_analyze_common*"]
