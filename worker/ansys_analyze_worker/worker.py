@@ -4,10 +4,20 @@ new *.task.json files, dispatches each one to the right handler (by
 task_type), and files the task away into done/ or failed/ when finished.
 
 This module knows NOTHING about eigenmodes, pedestals, or any other
-task-specific concept -- all of that lives in handlers/*.py and
-post_processing.py. To support a new solution type or design in the
-future, add a handler module and register it in handlers/__init__.py;
-nothing here needs to change. See docs/ARCHITECTURE.md section 6 and 10.
+task-specific concept -- all of that lives in handlers/*.py. To support a
+new solution type or design in the future, add a handler module and
+register it in handlers/__init__.py; nothing here needs to change. See
+docs/ARCHITECTURE.md section 6 and 10.
+
+`pause_event`/`release_event`/`stop_event` are accepted rather than always
+created internally so run_service.py can hand this class
+`multiprocessing.Event`s instead of `threading.Event`s when it runs the
+worker in its own child process (the normal case -- see run_service.py's
+module docstring for why the tray needs that separation). The two Event
+types share the same set()/clear()/is_set() interface, so this class
+doesn't need to know or care which one it was given; plain
+`threading.Event()`s (the default) are enough for `--no-tray` mode, where
+everything runs in one process/thread anyway.
 """
 from __future__ import annotations
 
@@ -35,55 +45,81 @@ class Worker:
         poll_interval_seconds: float = 5.0,
         aedt_version: Optional[str] = None,
         non_graphical: bool = False,
+        pause_event=None,
+        release_event=None,
+        stop_event=None,
+        status_path: Optional[str] = None,
     ):
         self.queue = queue
         self.poll_interval_seconds = poll_interval_seconds
         self.aedt_version = aedt_version
         self.non_graphical = non_graphical
 
-        self._pause_event = threading.Event()  # set == paused
-        self._stop_event = threading.Event()
-        self._restart_requested = False
+        self._pause_event = pause_event if pause_event is not None else threading.Event()  # set == paused
+        self._release_event = release_event if release_event is not None else threading.Event()  # set == release requested
+        self._stop_event = stop_event if stop_event is not None else threading.Event()
         self._desktop = None
+        # Optional path to a small JSON file this worker keeps overwritten
+        # with its current state -- the supervisor process (which owns the
+        # tray icon) polls it to label the tray menu, since it can't just
+        # read attributes off this object when the worker is running in a
+        # separate process (see supervisor.py). Every write goes through
+        # _set_status() so a transient write failure (e.g. the network
+        # share hiccuping) can never crash the scan loop.
+        self.status_path = status_path
 
     # -- lifecycle --------------------------------------------------------
     def pause(self) -> None:
         self._pause_event.set()
         logger.info("Worker paused.")
 
+    def release(self) -> None:
+        """
+        Stop picking up new tasks (like pause()) AND, once whatever task is
+        currently running finishes (or immediately, if none is), detach
+        from AEDT without closing it -- see _maybe_release_desktop(). Does
+        NOT interrupt a task that's already running; hard-aborting a
+        running task isn't something this class can do to itself (there's
+        no safe point to interrupt a blocking AEDT call from) -- that's
+        WorkerSupervisor.stop_current_run() in supervisor.py, which kills
+        and restarts the whole process instead.
+        """
+        self._release_event.set()
+        logger.info("Release requested -- will detach from AEDT once the current task (if any) finishes.")
+
     def resume(self) -> None:
         self._pause_event.clear()
+        self._release_event.clear()
         logger.info("Worker resumed.")
 
     @property
     def is_paused(self) -> bool:
-        return self._pause_event.is_set()
+        # Released implies paused: there's no "released but still picking
+        # up new tasks" state, since a task needs a live AEDT connection.
+        return self._pause_event.is_set() or self._release_event.is_set()
+
+    @property
+    def is_released(self) -> bool:
+        return self._release_event.is_set() and self._desktop is None
 
     def stop(self) -> None:
         self._stop_event.set()
 
-    def request_restart(self) -> None:
-        """
-        Ask the process to restart once the current tray/console loop
-        returns -- see run_service.py, which checks `restart_requested`
-        right after run_tray_app() and performs the actual process
-        replacement (os.execv) if it's set. This is how the tray's
-        "Reset" menu item works.
-
-        This does NOT wait for an in-flight task to finish -- if one is
-        mid-analysis in AEDT when this fires, the process restarts
-        immediately, and that task's file (left behind in in_progress/)
-        gets automatically moved back to pending/ and reprocessed from
-        scratch the moment the new process's run_forever() starts (see
-        recover_orphaned_tasks()). Same recovery path as an outright
-        crash -- just triggered on purpose.
-        """
-        self._restart_requested = True
-        self.stop()
-
-    @property
-    def restart_requested(self) -> bool:
-        return self._restart_requested
+    # -- status reporting -------------------------------------------------
+    def _set_status(self, **fields) -> None:
+        if self.status_path is None:
+            return
+        self._status_cache = {**getattr(self, "_status_cache", {}), **fields}
+        try:
+            tmp_path = self.status_path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(self._status_cache, f)
+            os.replace(tmp_path, self.status_path)
+        except OSError:
+            # Status reporting is a nice-to-have (it only feeds the tray's
+            # menu labels) -- never worth crashing the scan loop over a
+            # transient write failure (e.g. the network share hiccuping).
+            pass
 
     # -- AEDT connection ----------------------------------------------------
     def _ensure_desktop(self):
@@ -99,6 +135,25 @@ class Worker:
         )
         return self._desktop
 
+    def _maybe_release_desktop(self) -> None:
+        """
+        Called between tasks, never during one -- see is_paused, which
+        release() piggybacks on to make _process_pending_tasks() stop
+        after whatever task is currently in flight rather than draining
+        the rest of pending/ first. By the time this runs, nothing is
+        mid-analysis, so it's always safe to drop the connection.
+        """
+        if not self._release_event.is_set() or self._desktop is None:
+            return
+        logger.info("Releasing the AEDT desktop connection (AEDT itself stays open)...")
+        try:
+            self._desktop.release_desktop(close_projects=False, close_desktop=False)
+        except Exception:
+            logger.warning("Failed to release the AEDT desktop connection cleanly.", exc_info=True)
+        finally:
+            self._desktop = None
+        self._set_status(state="released")
+
     # -- main loop ------------------------------------------------------------
     def run_forever(self) -> None:
         recovered = recover_orphaned_tasks(self.queue)
@@ -110,9 +165,12 @@ class Worker:
 
         logger.info("Worker started. Watching %s", self.queue.pending)
         while not self._stop_event.is_set():
+            self._maybe_release_desktop()
             if self.is_paused:
+                self._set_status(state="released" if self.is_released else "paused")
                 time.sleep(self.poll_interval_seconds)
                 continue
+            self._set_status(state="running")
             try:
                 self._process_pending_tasks()
             except Exception:
@@ -153,6 +211,7 @@ class Worker:
 
             logger.info("Processing task %s (%s)", task["task_id"], task["task_type"])
             handler = get_handler(task["task_type"])
+            self._set_status(current_task_id=task["task_id"])
 
             hfss = self._open_project(task)
             try:
@@ -164,6 +223,8 @@ class Worker:
 
         except Exception as exc:
             self._finish_failure(in_progress_path, task, exc)
+        finally:
+            self._set_status(current_task_id=None)
 
     def _open_project(self, task: dict):
         from ansys.aedt.core import Hfss

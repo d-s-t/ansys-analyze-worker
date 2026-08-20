@@ -275,6 +275,25 @@ def get_task_status(queue: "QueuePaths", task_id: str) -> str:
     return "unknown"
 
 
+def read_task(queue: "QueuePaths", task_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Read a task's JSON back from whichever stage folder it's currently in
+    (done/failed/in_progress/pending). Returns None if it isn't in any of
+    them. For anything that needs the full task dict (project_file,
+    output_dir, objects, post_processing, ...) after the worker has
+    already moved it out of pending/ -- e.g. a client pipeline's
+    post-processing step, which needs the exact same fields it originally
+    wrote, without having to keep them around in memory across a possibly
+    resumed run.
+    """
+    for stage_dir in (queue.done, queue.failed, queue.in_progress, queue.pending):
+        path = os.path.join(stage_dir, f"{task_id}.task.json")
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+    return None
+
+
 def read_error_log(queue: "QueuePaths", task_id: str) -> Optional[str]:
     """Read back the traceback written for a failed task, if any."""
     error_log_path = os.path.join(queue.failed, f"{task_id}.task.json.error.log")
@@ -311,10 +330,11 @@ def retry_task(queue: "QueuePaths", task_id: str) -> bool:
     """
     Move a failed task back into pending/ so the worker picks it up
     again, and clear its old error log. The project bundle in
-    queue/projects/<task_id>/ is left in place -- the eigenmode_chain
-    handler already clears any leftover setups from a previous attempt
-    at the start of its run(), so re-running is safe. Returns False if
-    the task wasn't actually in failed/ (nothing to retry).
+    queue/projects/<task_id>/ is left in place -- for a handler like
+    eigenmode_analyze that only ever runs a setup the client already
+    created (never creates one itself), re-running just re-solves the
+    same setup, so this is always safe. Returns False if the task wasn't
+    actually in failed/ (nothing to retry).
     """
     import shutil
 
@@ -340,9 +360,10 @@ def recover_orphaned_tasks(queue: "QueuePaths") -> List[str]:
     (whether after a crash, a manual restart, or the tray app's "Reset")
     was abandoned mid-task by a previous run -- it isn't actually being
     worked on right now. Moving it back to pending/ lets it be picked up
-    and reprocessed from scratch, which is safe for eigenmode_chain
-    because it already clears any leftover setups from a prior attempt
-    at the start of its run(). Call this once, at worker startup.
+    and reprocessed from scratch, which is safe for a handler like
+    eigenmode_analyze that only ever runs a setup the client already
+    created rather than creating one itself. Call this once, at worker
+    startup.
 
     Returns the task_ids that were recovered.
     """

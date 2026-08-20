@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ansys-analyze-worker"
-version = "0.1.2"
+version = "0.1.3"
 description = "Generic background worker that watches a task queue and runs Ansys Electronics Desktop analyses"
 requires-python = ">=3.9"
 dependencies = [
@@ -14,8 +14,6 @@ dependencies = [
     "ansys-analyze-common @ git+https://github.com/d-s-t/ansys-analyze-worker.git#subdirectory=common",
     # Pinned deliberately -- see docs/ARCHITECTURE.md section 12.
     "pyaedt==1.0.0",
-    "pandas",
-    "matplotlib",
     "pystray",
     "Pillow",
 ]
