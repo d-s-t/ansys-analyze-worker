@@ -25,7 +25,7 @@ by whichever post_processing ops the task requests.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 from ..post_processing import run_post_processing
 
@@ -61,17 +61,17 @@ def _get_real_values(data, expression: str) -> List[float]:
     )
 
 
-def _fetch_solution_data(hfss, setup, expressions: List[str], log):
+def _fetch_solution_data(hfss, setup, expressions: Union[str, Sequence[str]], log):
     """
-    Fetch ONE SolutionData object covering every expression in
-    `expressions`, going through the setup object itself.
+    Fetch a SolutionData object for `expressions` (a single expression
+    name, or several) through the setup object.
 
     `setup.get_solution_data()` works out its own setup_sweep_name from
     the setup, so the handler no longer has to hand-build the
     "<setup> : LastAdaptive" string. If that comes back empty anyway
     (the setup-object path picking the wrong solution for an Eigenmode
-    setup is the plausible failure here, since Eigenmode has no
-    frequency sweep for it to match on), fall back to the explicit
+    setup is the plausible failure, since Eigenmode has no frequency
+    sweep for it to match on), fall back to the explicit
     post.get_solution_data(setup_sweep_name=...) form and say so in the
     log, so a real run tells us which path actually works.
 
@@ -86,6 +86,8 @@ def _fetch_solution_data(hfss, setup, expressions: List[str], log):
     if not expressions:
         return None
 
+    expressions = list(expressions) if not isinstance(expressions, str) else expressions
+
     data = setup.get_solution_data(expressions=expressions, report_category="Eigenmode")
     if data is not None:
         return data
@@ -98,6 +100,95 @@ def _fetch_solution_data(hfss, setup, expressions: List[str], log):
     return hfss.post.get_solution_data(
         expressions=expressions, setup_sweep_name=solution_name, report_category="Eigenmode"
     )
+
+
+def _read_values(
+    hfss,
+    setup,
+    expressions: List[str],
+    log,
+    export_csv_path: Optional[str] = None,
+) -> Dict[str, List[float]]:
+    """
+    Return {expression: [real values]} for every expression in
+    `expressions`.
+
+    PyAEDT v1.0.0's source accepts either form -- `get_solution_data` is
+    annotated `expressions: str | list`, and its `_get_report_object`
+    normalizes a bare string UP into a list
+    (`if isinstance(expressions, str): expressions = [expressions]`),
+    with `SolutionData` keying its data per expression and
+    `get_expression_data()` selecting among them. So one batched call
+    should return everything, turning 2 round-trips per mode into 2 per
+    setup -- worth having, given how much trouble flaky AEDT round-trips
+    have already caused here.
+
+    But that's read off the source, not proven against this specific
+    AEDT/PyAEDT install, and a batched call quietly returning only the
+    first expression would silently drop modes -- the worst possible
+    failure mode for this pipeline. So: try the batch, check which
+    expressions actually came back, and fetch anything missing one at a
+    time. Either way the values are correct; the log says which path
+    carried them, which settles the question empirically on the next
+    real run.
+    """
+    values: Dict[str, List[float]] = {}
+    if not expressions:
+        return values
+
+    data = _fetch_solution_data(hfss, setup, expressions, log)
+    if data is not None:
+        try:
+            available = set(data.expressions or [])
+        except Exception:  # pragma: no cover - depends on live AEDT
+            available = set()
+
+        for expr in expressions:
+            if expr not in available:
+                continue
+            try:
+                got = _get_real_values(data, expr)
+            except Exception as exc:  # pragma: no cover - depends on live AEDT
+                log(f"{setup.name}: could not read values for {expr!r}: {exc}")
+                continue
+            if got:
+                values[expr] = got
+
+        # Raw dump of whatever the batched call returned, as an artifact.
+        # Deliberately NOT what the numbers above are parsed from -- it's
+        # here so a run that looks wrong later can be checked against
+        # exactly what AEDT handed back.
+        if export_csv_path:
+            try:
+                data.export_data_to_csv(export_csv_path)
+            except Exception as exc:  # pragma: no cover - depends on live AEDT
+                log(f"Could not export raw solution data to {export_csv_path}: {exc}")
+
+    missing = [e for e in expressions if e not in values]
+    if missing:
+        if values:
+            log(
+                f"{setup.name}: batched call returned {len(values)} of {len(expressions)} "
+                f"expression(s); fetching the remaining {len(missing)} individually."
+            )
+        else:
+            log(
+                f"{setup.name}: batched call returned nothing usable; fetching each of the "
+                f"{len(missing)} expression(s) individually."
+            )
+        for expr in missing:
+            single = _fetch_solution_data(hfss, setup, expr, log)
+            if single is None:
+                continue
+            try:
+                got = _get_real_values(single, expr)
+            except Exception as exc:  # pragma: no cover - depends on live AEDT
+                log(f"{setup.name}: could not read values for {expr!r}: {exc}")
+                continue
+            if got:
+                values[expr] = got
+
+    return values
 
 
 def get_eigenmode_results(hfss, setup, log, export_csv_path: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -122,13 +213,6 @@ def get_eigenmode_results(hfss, setup, log, export_csv_path: Optional[str] = Non
     quantities -- `report_category="Eigenmode"` belongs on the
     get_solution_data call that fetches values, never on the listing
     call.
-
-    Values are then fetched in ONE call per category (all mode
-    expressions together, all Q expressions together) via the setup
-    object, rather than one round-trip per mode per quantity as before --
-    for 20 modes that's 2 calls instead of 40, so far fewer chances for a
-    flaky AEDT round-trip to take the whole task down. Everything after
-    that is pulled out of the returned SolutionData in memory.
 
     Mode and Q values are paired POSITIONALLY (same list index = same
     mode), matching Ansys' example, rather than regex-matching a mode
@@ -166,52 +250,29 @@ def get_eigenmode_results(hfss, setup, log, export_csv_path: Optional[str] = Non
         q_exprs = q_exprs[:pair_count]
 
     if not mode_exprs:
+        log(f"{setup.name}: no mode quantities available to read.")
         return []
 
-    freq_data = _fetch_solution_data(hfss, setup, mode_exprs, log)
-    if freq_data is None:
-        log(f"{setup.name}: no solution data returned for mode quantities {mode_exprs}.")
-        return []
-
-    q_data = _fetch_solution_data(hfss, setup, q_exprs, log)
-    if q_data is None and q_exprs:
+    freq_values = _read_values(hfss, setup, mode_exprs, log, export_csv_path=export_csv_path)
+    q_values = _read_values(hfss, setup, q_exprs, log) if q_exprs else {}
+    if q_exprs and not q_values:
         log(f"{setup.name}: no 'Eigen Q' data returned; reporting modes without Q values.")
-
-    # Dump the raw solution alongside the results as an artifact. This is
-    # not what the numbers below are read from (they come straight out of
-    # the SolutionData object in memory) -- it's here so a run that looks
-    # wrong later can be checked against exactly what AEDT handed back.
-    if export_csv_path:
-        try:
-            freq_data.export_data_to_csv(export_csv_path)
-        except Exception as exc:  # pragma: no cover - depends on live AEDT
-            log(f"Could not export raw solution data to {export_csv_path}: {exc}")
 
     results: List[Dict[str, Any]] = []
     for i, mode_expr in enumerate(mode_exprs, start=1):
-        try:
-            freq_values = _get_real_values(freq_data, mode_expr)
-        except Exception as exc:  # pragma: no cover - depends on live AEDT
-            log(f"{setup.name}: could not read values for {mode_expr!r}: {exc}")
-            continue
-        if not freq_values:
+        got = freq_values.get(mode_expr)
+        if not got:
             continue
 
-        q_value = None
-        if q_data is not None:
-            try:
-                q_values = _get_real_values(q_data, q_exprs[i - 1])
-                q_value = q_values[0] if q_values else None
-            except Exception as exc:  # pragma: no cover - depends on live AEDT
-                log(f"{setup.name}: could not read Q for {q_exprs[i - 1]!r}: {exc}")
+        q_got = q_values.get(q_exprs[i - 1]) if i <= len(q_exprs) else None
 
-        freq_hz = freq_values[0]
+        freq_hz = got[0]
         results.append(
             {
                 "mode": i,
                 "freq_hz": freq_hz,
                 "freq_ghz": freq_hz / 1e9,
-                "q": q_value,
+                "q": q_got[0] if q_got else None,
             }
         )
 
