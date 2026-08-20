@@ -25,37 +25,51 @@ by whichever post_processing ops the task requests.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, List
 
 from ..post_processing import run_post_processing
 
 
-def _real_values(data, expression: str) -> List[float]:
-    """Real value(s) for `expression` out of a SolutionData object."""
-    _, y = data.get_expression_data(expression=expression, formula="real")
-    return list(y)
+def _solution_name(hfss, setup) -> str:
+    """
+    The "<setup> : LastAdaptive" string that identifies this setup's
+    solution in every post-processing call.
+
+    Everything below has to pass this explicitly. `Setup.get_solution_data`
+    looks like it scopes itself to its own setup, but it does not: it
+    forwards `setup_sweep_name=sweep`, which is None unless the caller
+    asked for a named sweep, so AEDT silently answers out of
+    `hfss.nominal_adaptive` -- the FIRST setup in the design. In a chain
+    of setups every setup after the first would report setup 1's modes.
+    """
+    for name in hfss.existing_analysis_sweeps:
+        if name.split(" : ")[0] == setup.name:
+            return name
+    raise RuntimeError(
+        f"Setup {setup.name} has no solution entry in the design "
+        f"(existing_analysis_sweeps={hfss.existing_analysis_sweeps})."
+    )
+
+
+def _mode_index(expression: str) -> int:
+    """1 out of 'Mode(1)' / 'Q(1)'."""
+    match = re.search(r"\((\d+)\)", expression)
+    if not match:
+        raise RuntimeError(f"Cannot read a mode number out of report quantity {expression!r}.")
+    return int(match.group(1))
 
 
 def get_eigenmode_results(hfss, setup, log) -> List[Dict[str, Any]]:
     """
-    Resonant frequency (and Q, where available) for every mode of a
-    solved Eigenmode setup.
+    Resonant frequency and Q for every mode of a solved Eigenmode setup.
 
-    Two things here are easy to get wrong:
-
-    1. Eigenmode has no frequency sweep, so `Freq` is not an intrinsic
-       you can read back the way you would for a Driven Modal solution.
-       Each mode's frequency is its own report quantity, and Q lives in
-       a separate quantity category, "Eigen Q".
-    2. The quantity LISTING must be unfiltered.
-       `available_report_quantities(report_category=..., solution=...)`
-       silently returns an empty list on this AEDT/PyAEDT version --
-       `report_category="Eigenmode"` belongs on the get_solution_data
-       call that fetches values, never on the listing call.
-
-    Mode and Q are paired positionally (same index = same mode), as in
-    Ansys' own eigenmode example -- the expression text isn't guaranteed
-    to contain a parseable mode number.
+    Eigenmode has no frequency sweep, so `Freq` is not an intrinsic you
+    can read back the way you would for a Driven Modal solution. Each
+    mode is its own report quantity -- "Mode(n)", whose real part is the
+    resonant frequency in Hz -- and Q is a separate quantity, "Q(n)", in
+    the "Eigen Q" category. Both are fetched in one batched call and
+    paired by the mode number in the expression text.
     """
     if not setup.is_solved:
         raise RuntimeError(
@@ -63,37 +77,49 @@ def get_eigenmode_results(hfss, setup, log) -> List[Dict[str, Any]]:
             "are no eigenmodes to read back. Check the HFSS message manager on the worker machine."
         )
 
-    mode_exprs = hfss.post.available_report_quantities()
-    q_exprs = hfss.post.available_report_quantities(quantities_category="Eigen Q")
+    solution = _solution_name(hfss, setup)
 
-    if len(mode_exprs) != len(q_exprs):
-        # Pair up what we can rather than failing outright, but say so --
-        # silently dropping quantities would look like "the solve just
-        # found fewer modes".
-        count = min(len(mode_exprs), len(q_exprs))
-        log(
-            f"{setup.name}: {len(mode_exprs)} mode quantities vs {len(q_exprs)} 'Eigen Q' "
-            f"quantities; using the first {count} of each."
-        )
-        mode_exprs, q_exprs = mode_exprs[:count], q_exprs[:count]
+    # `solution=` is what binds the listing to THIS setup; without it the
+    # listing also falls back to the design's first setup. The listing
+    # call must stay otherwise unfiltered -- passing report_category here
+    # returns the wrong category ("Passivity"), not the mode quantities.
+    mode_exprs = hfss.post.available_report_quantities(solution=solution)
+    q_exprs = hfss.post.available_report_quantities(solution=solution, quantities_category="Eigen Q")
+    if not mode_exprs:
+        return []
+
+    data = hfss.post.get_solution_data(
+        expressions=mode_exprs + q_exprs,
+        setup_sweep_name=solution,
+        report_category="Eigenmode Parameters",
+    )
+    if data is None:
+        raise RuntimeError(f"No solution data returned for {solution}.")
+
+    # get_solution_data hands the expressions back in its own order, so
+    # index by name rather than by position.
+    def first_real(expression):
+        if expression not in data.expressions:
+            return None
+        _, y = data.get_expression_data(expression=expression, formula="real")
+        values = list(y)
+        return float(values[0]) if values else None
+
+    qs = {_mode_index(e): first_real(e) for e in q_exprs}
 
     results: List[Dict[str, Any]] = []
-    for i, (mode_expr, q_expr) in enumerate(zip(mode_exprs, q_exprs), start=1):
-        freq_data = setup.get_solution_data(expressions=mode_expr, report_category="Eigenmode")
-        freqs = _real_values(freq_data, mode_expr) if freq_data is not None else []
-        if not freqs:
+    for mode_expr in mode_exprs:
+        mode = _mode_index(mode_expr)
+        freq_hz = first_real(mode_expr)
+        if freq_hz is None:
             log(f"{setup.name}: no data for {mode_expr!r}; skipping.")
             continue
-
-        q_data = setup.get_solution_data(expressions=q_expr, report_category="Eigenmode")
-        qs = _real_values(q_data, q_expr) if q_data is not None else []
-
         results.append(
             {
-                "mode": i,
-                "freq_hz": freqs[0],
-                "freq_ghz": freqs[0] / 1e9,
-                "q": qs[0] if qs else None,
+                "mode": mode,
+                "freq_hz": freq_hz,
+                "freq_ghz": freq_hz / 1e9,
+                "q": qs.get(mode),
             }
         )
 
