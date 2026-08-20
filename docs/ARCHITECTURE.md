@@ -200,10 +200,11 @@ FAILED: pedestal_experiment\built_models\run_003\2mm_pedestal
 - **Try again** (`queue_common.retry_task()`) moves the task file back
   into `pending/` and clears the old error log, leaving the project
   bundle in `queue/projects/<task_id>/` exactly as it was. The worker
-  picks it straight back up. This is safe to do repeatedly: the project
-  always has exactly one setup (the client creates it once, up front —
-  §8.1), so re-running `analyze()` on it just re-solves the same setup —
-  there's no chain of setups that could pile up duplicates on a retry.
+  picks it straight back up. This is safe to do repeatedly: the client
+  creates its setup(s) once, up front (§8.1), and the worker never
+  creates one itself, so re-running `analyze()` just re-solves the same
+  setup(s) — there's no setup-creation logic on a retry that could pile
+  up duplicates.
 - **Skip** leaves it untouched for next time.
 
 ---
@@ -257,16 +258,17 @@ Each task is one JSON file, `<task_id>.task.json`, in `pending/`.
   "metadata": {
     "run": 3,
     "pedestal_depth": 4.0,
-    "source_step_file": "C:\\...\\pedestal_experiment\\4mm_pedestal.STEP",
-    "setup_name": "Setup_1"
+    "source_step_file": "C:\\...\\pedestal_experiment\\4mm_pedestal.STEP"
   }
 }
 ```
 
-The project already has its one Eigenmode setup ("Setup_1" above, created
-by the client before it was ever saved and queued — see §8.1) with its
-`MinimumFrequency`/`NumModes`/pass-count properties already set; `parameters`
-is empty because there's nothing left for the worker to configure.
+The project already has its Eigenmode setup (created by the client before
+it was ever saved and queued — see §8.1) with its `MinimumFrequency`/
+`NumModes`/pass-count properties already set; `parameters` is empty
+because there's nothing left for the worker to configure. The worker
+doesn't need to be told the setup's name — it just runs whatever
+setup(s) it finds (§6) — so nothing above records it either.
 
 `queue_common.build_task(...)` builds and validates a dict in exactly this
 shape for you — a client pipeline should always go through it rather than
@@ -462,14 +464,15 @@ from ansys_analyze_common import queue_common
    name pattern, by a manifest file, however makes sense for your model)
    and assigns `material_name`, boundaries (`assign_perfect_e`,
    `assign_radiation_boundary`, ports, etc.).
-4. **Create the (single) analysis setup — but do NOT call `analyze_setup`
-   / `analyze`.** The student license covers `create_setup` and setting
-   its properties just fine; it's only running the analysis that needs
-   the full license/compute, which is the worker's entire job now (§6).
-   One setup is enough — don't build a chain of setups here, and don't
-   let the worker create one either; if a project needs more than one
-   setup for some future experiment, that's a new handler's problem
-   (§6), not something to route around by queuing multiple tasks.
+4. **Create the analysis setup(s) — but do NOT call `analyze_setup` /
+   `analyze`.** The student license covers `create_setup` and setting its
+   properties just fine; it's only running the analysis that needs the
+   full license/compute, which is the worker's entire job now (§6). This
+   experiment only ever needs one setup, and `model_builder.py` creates
+   just the one -- but the worker itself doesn't enforce that; it simply
+   runs whatever setup(s) it finds (§6), so there's no need to route a
+   future multi-setup experiment around it. Either way, the worker is the
+   one that creates none and analyzes what's already there.
 5. **Save and close the project** (`hfss.save_project(project_path)`,
    then `hfss.close_project(...)`) — close it *before* copying, so the
    `.aedb` folder isn't mid-write when it gets copied.
@@ -878,7 +881,7 @@ re-testing the whole pipeline against a small batch first.
 | Symptom | Likely cause |
 |---|---|
 | Task sits in `pending/` forever | The worker isn't running, or is paused/released (check the tray icon's status line), or `ANSYS_ANALYZE_QUEUE_PATH` differs between the two machines/processes. |
-| Task appears in `failed/` immediately | Check `<task>.task.json.error.log` next to it — usually a bad `project_file` path, a `task_type` with no registered handler, or a project with no setup / more than one setup (`eigenmode_analyze` expects exactly one — see §6). |
+| Task appears in `failed/` immediately | Check `<task>.task.json.error.log` next to it — usually a bad `project_file` path, a `task_type` with no registered handler, or a project with no setup at all (`eigenmode_analyze` runs whatever setup(s) it finds — see §6 — but needs at least one). |
 | Worker can't connect to AEDT | Make sure the full AEDT session is already open on that machine before starting `run_service.py` — it attaches to an existing session (`new_desktop=False`), it does not launch one. If you just clicked Release, that's expected — it detaches on purpose; click Resume. |
 | Post-processing (client pipeline) finds no modes, or fails to reopen the project | Check that the worker's `result.json` for that task actually says `status: "success"` first — post-processing assumes the setup solved. If it did solve but extraction still fails, see §11's PyAEDT-version notes. |
 | "attempted relative import with no known parent package" | You ran a module inside `ansys_analyze_worker/` directly instead of via `ansys-analyze-worker` / `python -m ansys_analyze_worker.run_service` — see §10. |
