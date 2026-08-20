@@ -171,7 +171,7 @@ def run(hfss, task: Dict[str, Any], log) -> Dict[str, Any]:
         setup.props["MaximumDeltaFreqPerPass"] = max_delta_f
 
         log(f"Running {setup_name} starting at {current_min_freq:.3f} GHz...")
-        success = hfss.analyze_setup(setup_name)
+        success = setup.analyze() or setup.is_solved
         if not success:
             raise RuntimeError(f"Simulation {setup_name} failed. Check the HFSS message manager.")
 
