@@ -14,8 +14,6 @@ dependencies = [
     "ansys-analyze-common @ git+https://github.com/d-s-t/ansys-analyze-worker.git#subdirectory=common",
     # Pinned deliberately -- see docs/ARCHITECTURE.md section 12.
     "pyaedt==1.0.0",
-    "pandas",
-    "matplotlib",
     "pystray",
     "Pillow",
 ]

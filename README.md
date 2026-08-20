@@ -15,7 +15,7 @@ one it actually needs:
 | Package | Subdirectory | Contains | Needs |
 |---|---|---|---|
 | `ansys-analyze-common` | `common/` | `queue_common.py` only -- the shared, dependency-free (stdlib only) task/result schema. | nothing |
-| `ansys-analyze-worker` | `worker/` | The worker itself: the background service, tray app, post-processing, handlers. | `ansys-analyze-common`, `pyaedt`, `pandas`, `matplotlib`, `pystray`, `Pillow` |
+| `ansys-analyze-worker` | `worker/` | The worker itself: the background service (runs in its own child process, supervised by the tray app), handlers. | `ansys-analyze-common`, `pyaedt`, `pystray`, `Pillow` |
 
 ## Install
 
@@ -30,7 +30,7 @@ pip install "git+https://github.com/d-s-t/ansys-analyze-worker.git#subdirectory=
 
 `worker/pyproject.toml` declares `ansys-analyze-common` as a dependency
 (via the same repo), so this pulls that in automatically along with
-`pyaedt`/`pandas`/`matplotlib`/`pystray`/`Pillow`. This makes
+`pyaedt`/`pystray`/`Pillow`. This makes
 `from ansys_analyze_worker import worker` importable and installs the
 `ansys-analyze-worker` console command.
 
@@ -88,17 +88,29 @@ This attaches to the running AEDT session, watches
 `$ANSYS_ANALYZE_QUEUE_PATH/pending` for new task files, and shows a tray
 icon (bottom-right of the Windows taskbar) with:
 
-- **Pause / Resume processing**
+- **Status** -- what's currently running (if anything).
+- **Stop current run** -- hard-aborts whatever task is running right now
+  (the aborted task gets re-queued automatically and picked back up,
+  unless you Release first). Only enabled while a task is running.
+- **Release / Resume** -- Release stops picking up new tasks and, once
+  the current task (if any) finishes, detaches from AEDT without closing
+  it; Resume reconnects and starts scanning again.
 - **Open queue folder** / **Open log file**
-- **Reset (reload code)** -- restarts the service process so any edits
+- **Reset (reload code)** -- restarts the whole service so any edits
   made to files in this repo since it started take effect. Doesn't wait
-  for an in-flight task to finish; see `Worker.request_restart()`'s
-  docstring in `worker/ansys_analyze_worker/worker.py` for exactly what
-  happens to one if it's mid-analysis when you click this.
+  for an in-flight task to finish; see `WorkerSupervisor.request_restart()`'s
+  docstring in `worker/ansys_analyze_worker/supervisor.py` for exactly
+  what happens to one if it's mid-analysis when you click this.
 - **Exit**
 
+The actual scanning/analyzing work runs in its own child process, not on
+the tray's process -- see `docs/ARCHITECTURE.md` section 10.1 for why
+(short version: blocking AEDT calls used to freeze the tray solid).
+
 Run with `--no-tray` for a plain console service instead (useful for
-debugging, or running under a service manager that doesn't want a GUI).
+debugging, or running under a service manager that doesn't want a GUI) --
+that mode runs everything in a single process/thread, since there's no
+tray to keep responsive.
 
 ## Extending
 
