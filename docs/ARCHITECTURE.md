@@ -189,9 +189,13 @@ finds in the `failed` state, show the error and ask:
 ```
 FAILED: pedestal_experiment\built_models\run_003\2mm_pedestal
   task_id: eigenmode_analyze_20260813_173805_009120
-  error:   RuntimeError: Simulation Setup_1 failed. Check the HFSS message manager.
+  error:   RuntimeError: Project has no analysis setup. The client pipeline
+           must create the setup(s) before queuing the task...
   [R]emove / [T]ry again / [S]kip?
 ```
+
+(A setup that exists but fails to *solve* does NOT land a task here — see
+§5/§13; that surfaces later, during the client's post-processing step.)
 
 - **Remove** (`queue_common.remove_task()`) deletes `failed/<task_id>
   .task.json` + its `.error.log`, the whole `queue/projects/<task_id>/`
@@ -350,26 +354,38 @@ Key functions:
 
 ## 5. What the worker writes back (the results)
 
-The worker's job ends the moment the setup is solved — it does NOT
-extract mode data, build a CSV, or run any field plots. That all used to
-happen here; it's moved to the client pipeline's post-processing step
-(§9), because none of it needs the full license, only `analyze`/
-`analyze_setup` does (§12). So for a successful task, the worker writes
-just ONE small thing into `output_dir` (i.e. back into
+The worker's job ends the moment it's tried every setup in the project —
+it does NOT extract mode data, build a CSV, or run any field plots. That
+all used to happen here; it's moved to the client pipeline's
+post-processing step (§9), because none of it needs the full license,
+only `analyze`/`analyze_setup` does (§12). So for a successful task, the
+worker writes just ONE small thing into `output_dir` (i.e. back into
 `queue/projects/<task_id>/` itself, once resolved — §2.1):
 
 - `result.json` — `status: "success"`, `task_id`, `task_type`,
   `metadata` (copied through from the task file unchanged), and a
-  handler-specific `result` block. For `eigenmode_analyze`, `result` is
-  just `{"setup_name": ..., "solved": true}` — confirmation that the
-  client's setup ran and solved, nothing more.
+  handler-specific `result` block. For `eigenmode_analyze`, `result` is a
+  dict keyed by setup name, e.g. `{"Setup_1": {"success": true}}` (or
+  `{"Setup_1": {"success": false}, "Setup_2": {"success": true}}` for a
+  project with more than one setup where only some solved).
+
+**A per-setup solve failure does NOT fail the task.** `eigenmode_analyze`
+runs every setup it finds and records whether each one solved; a `false`
+there just means that particular setup's solution data won't be usable
+later. The task file still moves to `done/`, `status` is still
+`"success"` — the worker's job (attempt every setup, come back with an
+answer for each) genuinely did succeed. Only a structural problem (no
+setup in the project at all, or something throwing while opening/saving
+the project) lands the task in `failed/` — see §13 for how a per-setup
+solve failure actually surfaces instead (during the client's
+post-processing step, §9).
 
 The client pipeline reopens the project itself afterward (student
 version) and writes its OWN `client_result.json` into the same folder,
 with the actual mode data and post-processing output — see §9. That
-split keeps the worker a thin "run the one setup that's already there,
-hand back a yes/no" service; every plot-shaping and column decision lives
-in the one client pipeline that actually cares about them.
+split keeps the worker a thin "run whatever setups are already there,
+hand back what happened" service; every plot-shaping and column decision
+lives in the one client pipeline that actually cares about them.
 
 For a **failed** task, `result.json` still gets written (with
 `status: "failed"` and an `error` message) if `output_dir` was resolvable
@@ -881,9 +897,10 @@ re-testing the whole pipeline against a small batch first.
 | Symptom | Likely cause |
 |---|---|
 | Task sits in `pending/` forever | The worker isn't running, or is paused/released (check the tray icon's status line), or `ANSYS_ANALYZE_QUEUE_PATH` differs between the two machines/processes. |
-| Task appears in `failed/` immediately | Check `<task>.task.json.error.log` next to it — usually a bad `project_file` path, a `task_type` with no registered handler, or a project with no setup at all (`eigenmode_analyze` runs whatever setup(s) it finds — see §6 — but needs at least one). |
+| Task appears in `failed/` immediately | Check `<task>.task.json.error.log` next to it — usually a bad `project_file` path, a `task_type` with no registered handler, or a project with no setup at all (`eigenmode_analyze` needs at least one, but doesn't fail the task over a setup that exists and just didn't solve — see below). |
+| A setup didn't actually solve | This does NOT land the task in `failed/` — check the `success` flag for that setup name in the worker's own `result.json` (§5) first, or just let post-processing tell you (next row): it fails clearly, per-combo, the moment it tries to read solution data off an unsolved setup. |
 | Worker can't connect to AEDT | Make sure the full AEDT session is already open on that machine before starting `run_service.py` — it attaches to an existing session (`new_desktop=False`), it does not launch one. If you just clicked Release, that's expected — it detaches on purpose; click Resume. |
-| Post-processing (client pipeline) finds no modes, or fails to reopen the project | Check that the worker's `result.json` for that task actually says `status: "success"` first — post-processing assumes the setup solved. If it did solve but extraction still fails, see §11's PyAEDT-version notes. |
+| Post-processing (client pipeline) finds no modes, or fails to reopen the project | Check the `success` flag in the worker's `result.json` for that setup first (§5) — post-processing will raise a clear "not solved" error for a setup that didn't, and that combo's `post_status` becomes `"failed"` without blocking the rest of the run (§9). If it did solve but extraction still fails, see §11's PyAEDT-version notes. |
 | "attempted relative import with no known parent package" | You ran a module inside `ansys_analyze_worker/` directly instead of via `ansys-analyze-worker` / `python -m ansys_analyze_worker.run_service` — see §10. |
 | `ModuleNotFoundError: No module named 'ansys_analyze_common'` in a client pipeline | The client repo's dependency on the common package isn't installed — run `pip install -r requirements.txt` in that repo (§0), and check its `requirements.txt` line points at `...#subdirectory=common` (not `...#subdirectory=worker`, and not a stale local path). |
 | `FileNotFoundError` / "project not found" when the worker opens a project | `ANSYS_ANALYZE_QUEUE_PATH` doesn't point at the same physical location on both machines (e.g. different drive letters for the same network share), or the client pipeline queued the task before the copy into `projects/<task_id>/` finished — check that the copy step (§2.1) completed without error before the task file was written. |
