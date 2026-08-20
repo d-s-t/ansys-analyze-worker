@@ -25,7 +25,7 @@ by whichever post_processing ops the task requests.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 from ..post_processing import run_post_processing
 
@@ -61,72 +61,218 @@ def _get_real_values(data, expression: str) -> List[float]:
     )
 
 
-def get_eigenmode_results(hfss, setup_name: str) -> List[Dict[str, Any]]:
+def _fetch_solution_data(hfss, setup, expressions: Union[str, Sequence[str]], log):
+    """
+    Fetch a SolutionData object for `expressions` (a single expression
+    name, or several) through the setup object.
+
+    `setup.get_solution_data()` works out its own setup_sweep_name from
+    the setup, so the handler no longer has to hand-build the
+    "<setup> : LastAdaptive" string. If that comes back empty anyway
+    (the setup-object path picking the wrong solution for an Eigenmode
+    setup is the plausible failure, since Eigenmode has no frequency
+    sweep for it to match on), fall back to the explicit
+    post.get_solution_data(setup_sweep_name=...) form and say so in the
+    log, so a real run tells us which path actually works.
+
+    `expressions` must always be passed explicitly and non-empty: when
+    it's None/empty, PyAEDT fills it in internally by calling
+    `available_report_quantities(report_category=..., solution=...,
+    context=...)` -- the filtered form of the listing call, which
+    silently returns an empty list on this AEDT/PyAEDT version (see
+    get_eigenmode_results' docstring). Passing the expressions we
+    already listed ourselves keeps that broken path out of the picture.
+    """
+    if not expressions:
+        return None
+
+    expressions = list(expressions) if not isinstance(expressions, str) else expressions
+
+    data = setup.get_solution_data(expressions=expressions, report_category="Eigenmode")
+    if data is not None:
+        return data
+
+    solution_name = f"{setup.name} : LastAdaptive"
+    log(
+        f"setup.get_solution_data() returned no data for {setup.name}; retrying via "
+        f"post.get_solution_data(setup_sweep_name={solution_name!r})"
+    )
+    return hfss.post.get_solution_data(
+        expressions=expressions, setup_sweep_name=solution_name, report_category="Eigenmode"
+    )
+
+
+def _read_values(
+    hfss,
+    setup,
+    expressions: List[str],
+    log,
+    export_csv_path: Optional[str] = None,
+) -> Dict[str, List[float]]:
+    """
+    Return {expression: [real values]} for every expression in
+    `expressions`.
+
+    PyAEDT v1.0.0's source accepts either form -- `get_solution_data` is
+    annotated `expressions: str | list`, and its `_get_report_object`
+    normalizes a bare string UP into a list
+    (`if isinstance(expressions, str): expressions = [expressions]`),
+    with `SolutionData` keying its data per expression and
+    `get_expression_data()` selecting among them. So one batched call
+    should return everything, turning 2 round-trips per mode into 2 per
+    setup -- worth having, given how much trouble flaky AEDT round-trips
+    have already caused here.
+
+    But that's read off the source, not proven against this specific
+    AEDT/PyAEDT install, and a batched call quietly returning only the
+    first expression would silently drop modes -- the worst possible
+    failure mode for this pipeline. So: try the batch, check which
+    expressions actually came back, and fetch anything missing one at a
+    time. Either way the values are correct; the log says which path
+    carried them, which settles the question empirically on the next
+    real run.
+    """
+    values: Dict[str, List[float]] = {}
+    if not expressions:
+        return values
+
+    data = _fetch_solution_data(hfss, setup, expressions, log)
+    if data is not None:
+        try:
+            available = set(data.expressions or [])
+        except Exception:  # pragma: no cover - depends on live AEDT
+            available = set()
+
+        for expr in expressions:
+            if expr not in available:
+                continue
+            try:
+                got = _get_real_values(data, expr)
+            except Exception as exc:  # pragma: no cover - depends on live AEDT
+                log(f"{setup.name}: could not read values for {expr!r}: {exc}")
+                continue
+            if got:
+                values[expr] = got
+
+        # Raw dump of whatever the batched call returned, as an artifact.
+        # Deliberately NOT what the numbers above are parsed from -- it's
+        # here so a run that looks wrong later can be checked against
+        # exactly what AEDT handed back.
+        if export_csv_path:
+            try:
+                data.export_data_to_csv(export_csv_path)
+            except Exception as exc:  # pragma: no cover - depends on live AEDT
+                log(f"Could not export raw solution data to {export_csv_path}: {exc}")
+
+    missing = [e for e in expressions if e not in values]
+    if missing:
+        if values:
+            log(
+                f"{setup.name}: batched call returned {len(values)} of {len(expressions)} "
+                f"expression(s); fetching the remaining {len(missing)} individually."
+            )
+        else:
+            log(
+                f"{setup.name}: batched call returned nothing usable; fetching each of the "
+                f"{len(missing)} expression(s) individually."
+            )
+        for expr in missing:
+            single = _fetch_solution_data(hfss, setup, expr, log)
+            if single is None:
+                continue
+            try:
+                got = _get_real_values(single, expr)
+            except Exception as exc:  # pragma: no cover - depends on live AEDT
+                log(f"{setup.name}: could not read values for {expr!r}: {exc}")
+                continue
+            if got:
+                values[expr] = got
+
+    return values
+
+
+def get_eigenmode_results(hfss, setup, log, export_csv_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Retrieve the resonant frequency (and Q, if available) for every mode
     of a solved Eigenmode setup.
 
-    THIS IS THE FIX for the bug in the original script. Eigenmode
-    solutions do not have a frequency sweep, so `Freq` is *not* an
-    intrinsic you can read back with a plain
-    `hfss.post.get_solution_data(setup_sweep_name=...)` call the way you
-    would for a Driven Modal solution -- `freqs_data.intrinsics.get('Freq')`
-    is always empty for an Eigenmode setup, since Eigenmode has no such
-    intrinsic. Instead, each mode's resonant frequency is exposed as its
-    own report quantity, and quality factor lives in a separate quantity
+    Eigenmode solutions do not have a frequency sweep, so `Freq` is *not*
+    an intrinsic you can read back the way you would for a Driven Modal
+    solution -- `intrinsics.get('Freq')` is always empty for an Eigenmode
+    setup. Instead, each mode's resonant frequency is exposed as its own
+    report quantity, and quality factor lives in a separate quantity
     category, "Eigen Q".
 
-    A SECOND, more subtle bug was in how those quantities were listed:
-    `available_report_quantities(report_category="Eigenmode", solution=...)`
-    -- passing report_category/solution to the LISTING call -- silently
-    returns an empty list against this PyAEDT/AEDT version, which is why
-    this returned nothing even though the modes were plainly visible in
-    AEDT. Ansys' own PyAEDT eigenmode-filter example calls it with NO
-    filters at all (`available_report_quantities()` for the mode
-    quantities, `available_report_quantities(quantities_category="Eigen
-    Q")` for the Q quantities); report_category="Eigenmode" only belongs
-    on the later `get_solution_data(...)` calls that actually fetch each
-    quantity's value. This function now follows that exact pattern.
+    Listing those quantities has to be done with the UNFILTERED call:
+    `available_report_quantities(report_category="Eigenmode",
+    solution=...)` silently returns an empty list against this
+    PyAEDT/AEDT version, which is why this used to come back with
+    nothing even though the modes were plainly visible in AEDT. Ansys'
+    own PyAEDT eigenmode example calls it with no filters at all for the
+    mode quantities, and only `quantities_category="Eigen Q"` for the Q
+    quantities -- `report_category="Eigenmode"` belongs on the
+    get_solution_data call that fetches values, never on the listing
+    call.
 
-    Ansys' example also doesn't parse a mode number out of the expression
-    string -- it pairs the two lists positionally (same index = same
-    mode), since AEDT returns them in matching order. This function does
-    the same rather than regex-matching "(n)" out of the expression text,
-    which isn't guaranteed to be there.
+    Mode and Q values are paired POSITIONALLY (same list index = same
+    mode), matching Ansys' example, rather than regex-matching a mode
+    number out of the expression text -- that number isn't guaranteed to
+    be there.
     """
-    solution_name = f"{setup_name} : LastAdaptive"
+    # A setup that isn't actually solved has no data to read back, and
+    # every downstream symptom of that is confusing -- check up front and
+    # say so plainly instead.
+    try:
+        solved = setup.is_solved
+    except Exception as exc:  # pragma: no cover - depends on live AEDT
+        log(f"Could not read {setup.name}.is_solved ({exc}); attempting to read results anyway.")
+        solved = True
+    if not solved:
+        raise RuntimeError(
+            f"Setup {setup.name} reports is_solved=False -- AEDT has no solution data for it, "
+            "so there are no eigenmodes to read back. Check the HFSS message manager on the "
+            "worker machine for why the solve produced no solution."
+        )
 
     mode_exprs = hfss.post.available_report_quantities()
     q_exprs = hfss.post.available_report_quantities(quantities_category="Eigen Q")
 
     if len(mode_exprs) != len(q_exprs):
-        # Not necessarily fatal -- pair up what we can and drop the rest
-        # rather than erroring out on a partial mismatch.
+        # Pair up what we can rather than erroring out on a partial
+        # mismatch -- but say so, since silently dropping quantities here
+        # would otherwise look like "the solve just found fewer modes".
         pair_count = min(len(mode_exprs), len(q_exprs))
+        log(
+            f"{setup.name}: found {len(mode_exprs)} mode quantity/quantities but "
+            f"{len(q_exprs)} 'Eigen Q' quantity/quantities; using the first {pair_count} of each."
+        )
         mode_exprs = mode_exprs[:pair_count]
         q_exprs = q_exprs[:pair_count]
 
+    if not mode_exprs:
+        log(f"{setup.name}: no mode quantities available to read.")
+        return []
+
+    freq_values = _read_values(hfss, setup, mode_exprs, log, export_csv_path=export_csv_path)
+    q_values = _read_values(hfss, setup, q_exprs, log) if q_exprs else {}
+    if q_exprs and not q_values:
+        log(f"{setup.name}: no 'Eigen Q' data returned; reporting modes without Q values.")
+
     results: List[Dict[str, Any]] = []
-    for i, (mode_expr, q_expr) in enumerate(zip(mode_exprs, q_exprs), start=1):
-        freq_data = hfss.post.get_solution_data(
-            expressions=mode_expr, setup_sweep_name=solution_name, report_category="Eigenmode"
-        )
-        freq_values = _get_real_values(freq_data, mode_expr) if freq_data else None
-        if not freq_values:
+    for i, mode_expr in enumerate(mode_exprs, start=1):
+        got = freq_values.get(mode_expr)
+        if not got:
             continue
 
-        q_data = hfss.post.get_solution_data(
-            expressions=q_expr, setup_sweep_name=solution_name, report_category="Eigenmode"
-        )
-        q_values = _get_real_values(q_data, q_expr) if q_data else None
+        q_got = q_values.get(q_exprs[i - 1]) if i <= len(q_exprs) else None
 
-        freq_hz = freq_values[0]
+        freq_hz = got[0]
         results.append(
             {
                 "mode": i,
                 "freq_hz": freq_hz,
                 "freq_ghz": freq_hz / 1e9,
-                "q": q_values[0] if q_values else None,
+                "q": q_got[0] if q_got else None,
             }
         )
 
@@ -134,9 +280,8 @@ def get_eigenmode_results(hfss, setup_name: str) -> List[Dict[str, Any]]:
     return results
 
 
-def get_convergence_data(hfss, setup_name: str):
+def get_convergence_data(setup):
     try:
-        setup = hfss.get_setup(setup_name)
         return setup.props.get("MaxDeltaFreq", "N/A")
     except Exception:
         return "N/A"
@@ -183,12 +328,17 @@ def run(hfss, task: Dict[str, Any], log) -> Dict[str, Any]:
         if not success:
             raise RuntimeError(f"Simulation {setup_name} failed. Check the HFSS message manager.")
 
-        eigen_results = get_eigenmode_results(hfss, setup_name)
+        eigen_results = get_eigenmode_results(
+            hfss,
+            setup,
+            log,
+            export_csv_path=os.path.join(out_dir, f"{setup_name}_raw_solution.csv"),
+        )
         if not eigen_results:
             log(f"No modes found in {setup_name}. Stopping.")
             break
 
-        conv_error = str(get_convergence_data(hfss, setup_name))
+        conv_error = str(get_convergence_data(setup))
 
         for mode_result in eigen_results:
             row = {
@@ -226,11 +376,11 @@ def run(hfss, task: Dict[str, Any], log) -> Dict[str, Any]:
 
         setup_idx += 1
 
-    # Building modes_results.csv is Part 3's job (it also merges every
-    # task's data into one combined CSV for plotting) -- this handler
-    # just hands back the raw per-mode data via result.json, which
-    # worker.py writes into this same project folder (task["output_dir"]
-    # == the projects/<task_id>/ folder, not a separate results/ tree).
+    # Building the per-task CSV is the client pipeline's job (it also
+    # merges every task's data into one combined CSV for plotting) --
+    # this handler just hands back the raw per-mode data via result.json,
+    # which worker.py writes into this same project folder
+    # (task["output_dir"] == the projects/<task_id>/ folder).
     hfss.save_project(task["project_file"])
 
     return {
