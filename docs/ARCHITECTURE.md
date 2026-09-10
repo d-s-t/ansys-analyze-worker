@@ -223,7 +223,7 @@ Each task is one JSON file, `<task_id>.task.json`, in `pending/`.
 |---|---|---|
 | `schema_version` | int | Always `1` for now. Lets the worker refuse task files from a future/incompatible format instead of guessing. |
 | `task_id` | str | Unique ID. `queue_common.new_task_id()` generates one for you. |
-| `task_type` | str | Which **handler** in the worker should process this task (e.g. `"eigenmode_analyze"`). This is the whole mechanism that lets the worker stay generic — see §6. |
+| `task_type` | str | Which **handler** in the worker should process this task (e.g. `"run_setups"`). This is the whole mechanism that lets the worker stay generic — see §6. It names the *workflow*, not the physics: `solution_type` — not `task_type` — is what says whether a task is Eigenmode or DrivenModal. |
 | `project_file` | str | Path to the `.aedt` file, **relative to the queue root** (e.g. `"projects/<task_id>/0mm_pedestal.aedt"`) — see §2.1. Resolve with `queue_common.resolve_path()`. |
 | `output_dir` | str | Path to the folder the worker should write everything it produces into, **relative to the queue root** — normally the SAME folder as `project_file`'s directory (e.g. `"projects/<task_id>"`, via `queue_common.project_dir_for_task()`), not a separate location. Same resolution. |
 
@@ -232,7 +232,7 @@ Each task is one JSON file, `<task_id>.task.json`, in `pending/`.
 | Field | Type | Meaning |
 |---|---|---|
 | `design_name` | str or null | Which design inside the project to open. Omit to use the default/only design. |
-| `parameters` | object | Handler-specific extras, if any. `eigenmode_analyze` doesn't currently need any — the client already created the setup with every property it needs (frequency, modes, passes, ...) before queuing, so there's nothing left for the worker to configure. Kept in the schema for future handlers that might need it. |
+| `parameters` | object | Handler-specific extras, if any. `run_setups` doesn't currently need any — the client already created the setup with every property it needs (frequency, modes, passes, ...) before queuing, so there's nothing left for the worker to configure. Kept in the schema for future handlers that might need it. |
 | `objects` | object | Logical name → actual AEDT object name, e.g. `{"chip": "chip_1", "vacuum": "vacuum_1"}`. Not used by the worker — it's read back by the client pipeline's own post-processing step (§9), which uses it the same way the worker used to, to refer to "the chip" without knowing exact import-generated object names. |
 | `post_processing` | list | Which generic post-processing operations to run per result (e.g. field plots). Not run by the worker — see §7, this is entirely a client-side concept now, carried on the task file just so the client's post-processing step can read back what it originally asked for. |
 | `metadata` | object | Free-form data that has nothing to do with the analysis itself but that the client pipeline will want later (e.g. `{"pedestal_depth": 4.0}`). Copied through untouched into the results. |
@@ -243,7 +243,7 @@ Each task is one JSON file, `<task_id>.task.json`, in `pending/`.
 {
   "schema_version": 1,
   "task_id": "eigenmode_analyze_20260813_173801_412933",
-  "task_type": "eigenmode_analyze",
+  "task_type": "run_setups",
   "created_at": "2026-08-13T17:38:01",
   "project_file": "projects\\eigenmode_analyze_20260813_173801_412933\\4mm_pedestal.aedt",
   "design_name": null,
@@ -267,10 +267,37 @@ Each task is one JSON file, `<task_id>.task.json`, in `pending/`.
 }
 ```
 
-The project already has its Eigenmode setup (created by the client before
-it was ever saved and queued — see §8.1) with its `MinimumFrequency`/
-`NumModes`/pass-count properties already set; `parameters` is empty
-because there's nothing left for the worker to configure. The worker
+The same `task_type` with a different `solution_type` is all an
+S-parameter run takes — `task_type` picks the *workflow* (open the
+project, run its setups), `solution_type` is what's handed to PyAEDT when
+the project is opened:
+
+```json
+{
+  "schema_version": 1,
+  "task_id": "driven_20260813_173801_412933",
+  "task_type": "run_setups",
+  "project_file": "projects\\driven_20260813_173801_412933\\4mm_pedestal.aedt",
+  "solution_type": "DrivenModal",
+  "output_dir": "projects\\driven_20260813_173801_412933",
+  "parameters": {},
+  "metadata": {"run": 3, "pedestal_depth": 4.0}
+}
+```
+
+Note that `task_id` there starts with `"driven"`, not with `task_type`.
+`new_task_id()` prefixes the id with whatever string it's given, and the
+client may well keep passing a readable label like `"eigenmode"` or
+`"driven"` for the queue folder names while `task_type` stays
+`"run_setups"` — so nothing should ever assume
+`task_id.startswith(task_type)`.
+
+The project already has its setup (created by the client before it was
+ever saved and queued — see §8.1) with every property it needs already
+set: `MinimumFrequency`/`NumModes`/pass counts for an Eigenmode run, or a
+solution frequency plus a frequency sweep and ports for a Driven one.
+`parameters` is empty because there's nothing left for the worker to
+configure either way. The worker
 doesn't need to be told the setup's name — it just runs whatever
 setup(s) it finds (§6) — so nothing above records it either.
 
@@ -287,16 +314,16 @@ setup.props["NumModes"] = 20
 hfss.save_project(project_path)
 hfss.close_project(name=hfss.project_name)   # release the .aedb before copying it
 
-task_id = queue_common.new_task_id("eigenmode_analyze")
+task_id = queue_common.new_task_id("run_setups")
 relative_project_file = queue_common.copy_project_to_queue(queue, task_id, project_dir)
 relative_output_dir = queue_common.project_dir_for_task(task_id)
 
 task = queue_common.build_task(
-    task_type="eigenmode_analyze",
+    task_type="run_setups",
     project_file=relative_project_file,
     output_dir=relative_output_dir,
     task_id=task_id,
-    solution_type="Eigenmode",
+    solution_type="Eigenmode",   # "DrivenModal" here instead for an S-parameter run
     objects={...}, post_processing=[...], metadata={...},
 )
 queue_common.write_task_atomically(queue, task)
@@ -364,12 +391,12 @@ worker writes just ONE small thing into `output_dir` (i.e. back into
 
 - `result.json` — `status: "success"`, `task_id`, `task_type`,
   `metadata` (copied through from the task file unchanged), and a
-  handler-specific `result` block. For `eigenmode_analyze`, `result` is a
+  handler-specific `result` block. For `run_setups`, `result` is a
   dict keyed by setup name, e.g. `{"Setup_1": {"success": true}}` (or
   `{"Setup_1": {"success": false}, "Setup_2": {"success": true}}` for a
   project with more than one setup where only some solved).
 
-**A per-setup solve failure does NOT fail the task.** `eigenmode_analyze`
+**A per-setup solve failure does NOT fail the task.** `run_setups`
 runs every setup it finds and records whether each one solved; a `false`
 there just means that particular setup's solution data won't be usable
 later. The task file still moves to `done/`, `status` is still
@@ -411,26 +438,41 @@ pedestals, chips, or anything experiment-specific. All it does is:
 6. Call `handler(hfss, task, log)`.
 7. File the task into `done/` or `failed/` and write `result.json`.
 
-**To support a new solution type or design in the future:**
+**To support a new solution type: you almost certainly don't need to do
+anything here.** `run_setups` is solution-type agnostic — it opens the
+project and runs whatever setup(s) the client already created, whatever
+kind they are. DrivenModal with a frequency sweep goes through it
+unchanged (`setup.analyze()` solves the adaptive passes *and* the sweeps
+under that setup), and so does DrivenTerminal. The client just sets
+`solution_type` on the task. No new handler, no new `task_type`.
+
+**A new handler is for a genuinely different *workflow*** — one that has
+to create state of its own, chain setups together, or drive a non-HFSS
+app — not for a new solution type whose setups the client pre-creates.
+If you do have one:
 
 1. Add a new module in `ansys_analyze_worker/handlers/`, e.g.
-   `handlers/driven_modal_sweep.py`.
+   `handlers/maxwell_sweep_chain.py`.
 2. Implement `run(hfss, task, log) -> dict` in it. It receives the open
    `Hfss`/`Maxwell3d`/etc. object, the full task dict, and a logging
-   function. Following `eigenmode_analyze.py`'s lead, it should find the
-   setup(s) the client already created, run them, save the project, and
-   return a small dict describing what happened (this becomes
-   `result.json`'s `"result"` block) — it should NOT create a setup or
-   extract/post-process results itself (§7, §12).
+   function. Following `run_setups.py`'s lead, it should return a small
+   dict describing what happened (this becomes `result.json`'s
+   `"result"` block) — and, unless the workflow genuinely requires
+   otherwise, it should still NOT create a setup or extract/post-process
+   results itself (§7, §12).
 3. Register it: in `handlers/__init__.py`, add
-   `"driven_modal_sweep": driven_modal_sweep.run` to `HANDLERS`.
+   `"maxwell_sweep_chain": maxwell_sweep_chain.run` to `HANDLERS`.
 
 Nothing in `worker.py`, `tray_app.py`, `supervisor.py`, or the queue
 plumbing needs to change. This is also why `task_type` exists as a
-separate field from `solution_type` — `task_type` names a whole
-*workflow*, not just an AEDT solution type, even though for
-`eigenmode_analyze` that workflow is now deliberately as small as
-possible: open, run the one existing setup, hand it back.
+separate field from `solution_type`. They answer different questions:
+`task_type` selects the handler — which *workflow* runs — while
+`solution_type` is just passed through to PyAEDT when the project is
+opened. `run_setups` deliberately spans every solution type, because its
+workflow is now as small as possible: open, run whatever setups are
+already there, hand it back. `"eigenmode_analyze"` stays registered as a
+legacy alias for it, for clients and queued tasks that predate the
+rename.
 
 ---
 
@@ -443,10 +485,10 @@ on disk — so it moved to the client pipeline, which reopens the analyzed
 project itself (student version) right after the worker reports a task
 done. See the *client* repo's `eigen_mode_analyze/post_processing.py`
 (the generic ops, moved here basically unchanged) and
-`eigen_mode_analyze/postprocess.py` (the eigenmode-result extraction plus
-the per-run orchestration, adapted from what used to be
-`handlers/eigenmode_chain.py`) — and §9 below for how it fits into the
-pipeline. The task's `post_processing` list (§3) still describes which
+`eigen_mode_analyze/postprocess.py` (the result extraction plus the
+per-run orchestration) — which pulls out *either* eigenmode results
+(frequency, Q) *or* S-parameters, depending on the run's
+`solution_type` — and §9 below for how it fits into the pipeline. The task's `post_processing` list (§3) still describes which
 ops to run per mode; the worker just carries that field through
 untouched now instead of acting on it.
 
@@ -770,11 +812,14 @@ immediately; that task's file is left behind in `in_progress/`, and the
 moment the new worker child's `run_forever()` starts, `queue_common.
 recover_orphaned_tasks()` moves it straight back to `pending/` to be
 reprocessed from scratch — the same recovery path a genuine crash would
-trigger, just on purpose. This is safe for `eigenmode_analyze` because
+trigger, just on purpose. This is safe for `run_setups` because
 re-running `analyze()` on the same already-created setup is idempotent —
-there's no leftover-setup cleanup to worry about the way the old
-multi-setup `eigenmode_chain` handler needed (§6); keep that in mind if
-you write a new handler that creates state of its own mid-run.
+and that holds for driven setups too: solving the adaptive passes and the
+frequency sweep again from scratch costs wall-clock time, but leaves the
+same solution data behind. There's no leftover-setup cleanup to worry
+about the way the old multi-setup `eigenmode_chain` handler needed (§6);
+keep that in mind if you write a new handler that creates state of its
+own mid-run.
 
 ---
 
@@ -897,7 +942,8 @@ re-testing the whole pipeline against a small batch first.
 | Symptom | Likely cause |
 |---|---|
 | Task sits in `pending/` forever | The worker isn't running, or is paused/released (check the tray icon's status line), or `ANSYS_ANALYZE_QUEUE_PATH` differs between the two machines/processes. |
-| Task appears in `failed/` immediately | Check `<task>.task.json.error.log` next to it — usually a bad `project_file` path, a `task_type` with no registered handler, or a project with no setup at all (`eigenmode_analyze` needs at least one, but doesn't fail the task over a setup that exists and just didn't solve — see below). |
+| Task appears in `failed/` immediately | Check `<task>.task.json.error.log` next to it — usually a bad `project_file` path, a `task_type` with no registered handler, or a project with no setup at all (`run_setups` needs at least one, but doesn't fail the task over a setup that exists and just didn't solve — see below). |
+| Task reports `success: true` but the client finds no sweep data | The adaptive pass solved and the frequency sweep did not. `success` is in practice just `setup.is_solved`, which queries the *adaptive* solution (`<setup> : LastAdaptive`) and says nothing about the sweeps under it — so a driven setup whose sweep failed still reports `true` and still files into `done/`. That's deliberate (the worker reports what it ran; the client's post-processing is what surfaces missing solution data — §5/§7). Check the HFSS message manager on the worker machine for the sweep's actual error. |
 | A setup didn't actually solve | This does NOT land the task in `failed/` — check the `success` flag for that setup name in the worker's own `result.json` (§5) first, or just let post-processing tell you (next row): it fails clearly, per-combo, the moment it tries to read solution data off an unsolved setup. |
 | Worker can't connect to AEDT | Make sure the full AEDT session is already open on that machine before starting `run_service.py` — it attaches to an existing session (`new_desktop=False`), it does not launch one. If you just clicked Release, that's expected — it detaches on purpose; click Resume. |
 | Post-processing (client pipeline) finds no modes, or fails to reopen the project | Check the `success` flag in the worker's `result.json` for that setup first (§5) — post-processing will raise a clear "not solved" error for a setup that didn't, and that combo's `post_status` becomes `"failed"` without blocking the rest of the run (§9). If it did solve but extraction still fails, see §11's PyAEDT-version notes. |
