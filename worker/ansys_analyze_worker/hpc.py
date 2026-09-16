@@ -97,6 +97,17 @@ GPUS_ENV_VAR = "ANSYS_ANALYZE_GPUS"
 # active HPC configuration". Any numeric spelling of zero ("0", "00",
 # "+0", "-0", ...) means the same thing -- see _means_use_aedt_settings()
 # below, which is what actually decides this everywhere it matters.
+#
+# This makes "0" ambiguous for TASKS/GPUS specifically, in a way that's
+# worth being explicit about rather than "fixing": PyAEDT's own
+# analyze_setup() decides whether to touch the HPC config at all with a
+# plain Python truthiness check, `gpus or tasks or cores` -- so an
+# explicit `gpus=0` and an unset `gpus=None` are *already*
+# indistinguishable to PyAEDT itself, before this module's own sentinel
+# handling ever enters into it. There is no way through this worker to
+# force GPUs/tasks down to zero while leaving `cores` at `aedt` (PyAEDT
+# would simply skip the whole HPC override for that solve either way);
+# doing that requires changing AEDT's own dialog configuration directly.
 USE_AEDT_SETTINGS_VALUES = frozenset({"aedt", "auto", "default", "0"})
 
 
