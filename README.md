@@ -107,6 +107,29 @@ The actual scanning/analyzing work runs in its own child process, not on
 the tray's process -- see `docs/ARCHITECTURE.md` section 10.1 for why
 (short version: blocking AEDT calls used to freeze the tray solid).
 
+### How many cores it solves on
+
+By default the worker solves on **every logical processor** of the
+machine it runs on. This is worth knowing about because PyAEDT does not
+inherit AEDT's own HPC settings: `setup.analyze()` defaults to
+`cores=1` and writes its own `pyaedt_config` entry into "HPC and
+Analysis Options" to enforce it, so a worker that didn't pass the core
+count explicitly would solve single-threaded no matter what that dialog
+says (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §10.2).
+
+Override it per machine with environment variables -- no code change, no
+redeploy:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ANSYS_ANALYZE_CORES` | every logical processor | Cores per solve. A number caps it (e.g. to what your HPC license allows, or the physical core count); `aedt` leaves AEDT's own HPC configuration untouched. |
+| `ANSYS_ANALYZE_TASKS` | AEDT's own | Solve tasks/engines. Rarely needed -- AEDT auto-distributes tasks (`(Auto)` in the dialog). |
+| `ANSYS_ANALYZE_GPUS` | AEDT's own | GPUs to use, where the solver and license support it. |
+
+They're re-read for every task, so changing one and clicking the tray's
+**Reset** applies it without restarting anything by hand. Each solve
+logs what it used (`Analyzing Setup_1 with 16 core(s)...`).
+
 Run with `--no-tray` for a plain console service instead (useful for
 debugging, or running under a service manager that doesn't want a GUI) --
 that mode runs everything in a single process/thread, since there's no
