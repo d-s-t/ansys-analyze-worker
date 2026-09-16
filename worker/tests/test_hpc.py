@@ -124,6 +124,45 @@ class ResolveHpcOptionsTests(HpcOptionEnvTestCase):
             options = hpc.resolve_hpc_options()
         self.assertIsNone(options["cores"])
 
+    def test_undetectable_cpu_count_combined_with_gpus_warns_but_cannot_fix_cores(self):
+        # Regression test: the coupling-bug fallback used to recompute
+        # os.cpu_count() as ITS "fallback" value too, so when cpu_count()
+        # is undetectable (returns None), the "fix" silently produced
+        # None again -- the exact bug the fallback exists to prevent,
+        # just for this one edge case. There is nothing left this module
+        # can do without a concrete core count, so cores staying None
+        # here is correct as long as the warning says so honestly
+        # instead of claiming a fix that didn't happen (see the next
+        # test for that).
+        os.environ[hpc.GPUS_ENV_VAR] = "2"
+        with mock.patch.object(hpc.os, "cpu_count", return_value=None):
+            with self.assertLogs(hpc.logger, level="WARNING"):
+                options = hpc.resolve_hpc_options()
+        self.assertEqual(options, {"cores": None, "tasks": None, "gpus": 2})
+
+    def test_warning_does_not_misattribute_an_unset_cores_variable(self):
+        # Regression test: the warning used to hardcode
+        # "ANSYS_ANALYZE_CORES=aedt was requested" even when that
+        # variable was never set at all (cores was None only because
+        # os.cpu_count() itself returned None) -- misleading anyone
+        # reading the log about what actually happened.
+        os.environ[hpc.GPUS_ENV_VAR] = "2"
+        with mock.patch.object(hpc.os, "cpu_count", return_value=None):
+            with self.assertLogs(hpc.logger, level="WARNING") as log:
+                hpc.resolve_hpc_options()
+        message = " ".join(log.output)
+        self.assertNotIn("=aedt", message)
+        self.assertIn("unset", message)
+
+    def test_warning_correctly_attributes_an_explicit_aedt_request(self):
+        os.environ[hpc.CORES_ENV_VAR] = "aedt"
+        os.environ[hpc.GPUS_ENV_VAR] = "2"
+        with mock.patch.object(hpc.os, "cpu_count", return_value=8):
+            with self.assertLogs(hpc.logger, level="WARNING") as log:
+                hpc.resolve_hpc_options()
+        message = " ".join(log.output)
+        self.assertIn("asked to leave it alone", message)
+
 
 class DescribeHpcOptionsTests(unittest.TestCase):
     def test_all_none_describes_aedt_default(self):
