@@ -157,14 +157,23 @@ def resolve_hpc_options() -> Dict[str, Optional[int]]:
         # cores would silently fall back to the *template's* NumCores=4
         # instead of the dialog's real value, which is exactly the kind
         # of silent under-utilization this module exists to prevent.
-        overriding_var = TASKS_ENV_VAR if tasks else GPUS_ENV_VAR
-        raw_cores = os.environ.get(CORES_ENV_VAR, "").strip().lower()
-        cores_was_explicit = raw_cores in USE_AEDT_SETTINGS_VALUES
-        cores_reason = (
-            f"{CORES_ENV_VAR}={raw_cores!r} asked to leave it alone"
-            if cores_was_explicit
-            else f"{CORES_ENV_VAR} is unset and os.cpu_count() couldn't determine one"
+        overriding_vars = " and ".join(
+            var for var, value in ((TASKS_ENV_VAR, tasks), (GPUS_ENV_VAR, gpus)) if value
         )
+        raw_cores = os.environ.get(CORES_ENV_VAR, "").strip()
+        if raw_cores.lower() in USE_AEDT_SETTINGS_VALUES:
+            cores_reason = f"{CORES_ENV_VAR}={raw_cores!r} asked to leave it alone"
+        elif raw_cores:
+            # cores is None here despite the variable being set to
+            # something -- _resolve_env_option() already warned about
+            # *that* (an unparseable/negative value) and fell back to
+            # `default=cpu_count`, which then turned out to be None too.
+            # Different cause from "unset"; say so, or an operator fixing
+            # a typo'd value would be sent looking for a variable that
+            # was never missing in the first place.
+            cores_reason = f"{CORES_ENV_VAR}={raw_cores!r} was invalid and os.cpu_count() couldn't determine one either"
+        else:
+            cores_reason = f"{CORES_ENV_VAR} is unset and os.cpu_count() couldn't determine one"
         if cpu_count is not None:
             # There IS a concrete core count available -- use it instead
             # of letting cores silently fall back to the template's 4,
@@ -176,7 +185,7 @@ def resolve_hpc_options() -> Dict[str, Optional[int]]:
                 "reset cores to that template's default of 4 instead). Falling back "
                 "cores to every logical processor (%d) instead.",
                 cores_reason,
-                overriding_var,
+                overriding_vars,
                 cpu_count,
             )
             cores = cpu_count
@@ -191,7 +200,7 @@ def resolve_hpc_options() -> Dict[str, Optional[int]]:
                 "will silently run on that template's default of 4 cores, not the "
                 "dialog's real value. Set %s to an explicit number to avoid this.",
                 cores_reason,
-                overriding_var,
+                overriding_vars,
                 CORES_ENV_VAR,
             )
 

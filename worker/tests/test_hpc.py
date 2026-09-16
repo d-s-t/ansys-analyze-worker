@@ -163,6 +163,37 @@ class ResolveHpcOptionsTests(HpcOptionEnvTestCase):
         message = " ".join(log.output)
         self.assertIn("asked to leave it alone", message)
 
+    def test_warning_distinguishes_invalid_cores_value_from_unset(self):
+        # Regression test: a garbage ANSYS_ANALYZE_CORES value combined
+        # with an undetectable os.cpu_count() used to be reported as
+        # "unset", even though the variable was set (just to something
+        # unparseable) -- sending anyone debugging it looking for a
+        # missing variable instead of a typo'd one.
+        os.environ[hpc.CORES_ENV_VAR] = "banana"
+        os.environ[hpc.GPUS_ENV_VAR] = "2"
+        with mock.patch.object(hpc.os, "cpu_count", return_value=None):
+            with self.assertLogs(hpc.logger, level="WARNING") as log:
+                options = hpc.resolve_hpc_options()
+        message = " ".join(log.output)
+        self.assertIn("was invalid", message)
+        self.assertNotIn("is unset", message)
+        self.assertIsNone(options["cores"])
+
+    def test_warning_names_both_overriding_variables_when_both_are_set(self):
+        # Regression test: the warning used to name only whichever of
+        # tasks/gpus happened to be checked first, silently dropping the
+        # other one even when both were set.
+        os.environ[hpc.CORES_ENV_VAR] = "aedt"
+        os.environ[hpc.TASKS_ENV_VAR] = "2"
+        os.environ[hpc.GPUS_ENV_VAR] = "1"
+        with mock.patch.object(hpc.os, "cpu_count", return_value=8):
+            with self.assertLogs(hpc.logger, level="WARNING") as log:
+                options = hpc.resolve_hpc_options()
+        message = " ".join(log.output)
+        self.assertIn(hpc.TASKS_ENV_VAR, message)
+        self.assertIn(hpc.GPUS_ENV_VAR, message)
+        self.assertEqual(options, {"cores": 8, "tasks": 2, "gpus": 1})
+
 
 class DescribeHpcOptionsTests(unittest.TestCase):
     def test_all_none_describes_aedt_default(self):
