@@ -151,16 +151,27 @@ def resolve_hpc_options() -> Dict[str, Optional[int]]:
     """
     The `cores`/`tasks`/`gpus` keyword arguments to hand `setup.analyze()`.
 
-    Resolved fresh per task rather than once at startup, so editing the
-    variables and clicking the tray's "Reset" (which re-execs the
-    service, §10 of the architecture doc) is enough to change them --
-    and so a value fixed at import time can never go stale.
+    Resolved fresh per task rather than once at startup, so a change
+    already reflected in THIS process's `os.environ` takes effect on the
+    very next task with no restart at all -- a value fixed at import
+    time can never go stale. That is a narrower guarantee than it
+    sounds, though: editing the underlying OS-level environment variable
+    (Windows System Properties, `setx`, a shell profile) while the
+    worker is already running is a different story. The tray's "Reset"
+    (§10 of the architecture doc) re-execs via `os.execv()`, which has
+    no `env` argument and so inherits THIS process's existing
+    environment as-is -- it does NOT re-read the OS's environment
+    variable store, only re-import this repo's own modules from disk.
+    Reset alone will NOT pick up an env var edited after the worker
+    started; only fully exiting the tray app (Exit) and relaunching it
+    from a shell/session/Startup entry that already has the new value
+    will.
 
     | Variable | Default | Meaning |
     |---|---|---|
     | `ANSYS_ANALYZE_CORES` | every logical processor | Cores for the solve. `aedt` (or `auto`/`default`/`0`) leaves AEDT's own HPC configuration untouched -- but only if `tasks`/`gpus` below are ALSO left unset; see the module docstring's note on the unsupported combination. |
     | `ANSYS_ANALYZE_TASKS` | PyAEDT's template default (`1`, but auto-distributed anyway) | Solve tasks/engines (`NumEngines`). Rarely worth setting: the ACF template ships `UseAutoSettings=true`, so AEDT distributes tasks itself regardless -- that's the `(Auto)` in the dialog. |
-    | `ANSYS_ANALYZE_GPUS` | PyAEDT's template default (`0`, i.e. no GPU acceleration) | GPUs to use. Unlike `tasks`, there is no auto-distribution fallback for this one -- set it explicitly on any machine that should solve with GPU acceleration, since leaving it unset does NOT inherit whatever AEDT's dialog already has configured (see the module docstring above). |
+    | `ANSYS_ANALYZE_GPUS` | PyAEDT's template default (`0`, i.e. no GPU acceleration) | GPUs to use. Unlike `tasks`, there is no auto-distribution fallback for this one -- set it explicitly on any machine that should solve with GPU acceleration, since leaving it unset means zero GPUs whenever `cores` is also being overridden (the default) rather than inheriting whatever AEDT's dialog has configured. Only `ANSYS_ANALYZE_CORES=aedt` with `tasks` *also* left unset skips this entirely and leaves the dialog's own GPU setting untouched (see the module docstring above). |
     """
     # os.cpu_count() can return None (no way to determine it) -- tracked
     # separately from `cores` below, since once tasks/gpus is also in

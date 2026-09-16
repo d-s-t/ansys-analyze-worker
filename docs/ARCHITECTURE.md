@@ -724,7 +724,7 @@ you'd get running any submodule of any package directly.
 | `ANSYS_ANALYZE_QUEUE_PATH` | Yes | Root folder for the task queue (§2). Must be reachable — read/write — from every machine involved. In the common two-machine setup this needs to be a shared/network path. Because project bundles and results both live *inside* this folder (§2.1), you don't need any other shared location — just this one. |
 | `ANSYS_ANALYZE_CORES` | No | Cores each solve runs on (§10.2). Default: **every logical processor** on the worker machine. Set it to a number to cap it (e.g. what your HPC license allows, or the physical core count), or to `aedt` to leave AEDT's own "HPC and Analysis Options" configuration untouched — but only if `tasks`/`gpus` below are ALSO left unset; setting either one forces a config rebuild that resets cores anyway, which the worker detects and falls back rather than let happen silently (§10.2). |
 | `ANSYS_ANALYZE_TASKS` | No | Solve tasks/engines (`NumEngines`). Default: PyAEDT's own template default (`1`) — rarely worth setting, since that same template ships `UseAutoSettings=true` and AEDT distributes tasks itself regardless (the `(Auto)` in the dialog). |
-| `ANSYS_ANALYZE_GPUS` | No | GPUs to use, for a solver and license that support GPU acceleration. Default: PyAEDT's own template default, `0` — **not** whatever AEDT's dialog has configured (§10.2). Set this explicitly on any machine that solves with GPU acceleration. |
+| `ANSYS_ANALYZE_GPUS` | No | GPUs to use, for a solver and license that support GPU acceleration. Default: PyAEDT's own template default, `0`, whenever `cores` is also being overridden (the default) — **not** whatever AEDT's dialog has configured, unless `ANSYS_ANALYZE_CORES=aedt` is set with `tasks` also left unset, which leaves the dialog's GPU setting untouched instead (§10.2). Set this explicitly on any machine that solves with GPU acceleration. |
 
 ### Command-line options
 
@@ -853,10 +853,22 @@ machine, and the three environment variables above override that per
 machine — the worker machine's core count is not something a client
 pipeline on a *different* machine could sensibly put in a task file, and
 not worth a code edit or redeploy either. The options are re-read per
-task, so changing a variable and clicking the tray's **Reset** (which
-re-execs the service) is enough to apply it; the line the worker logs
-for each setup (`Analyzing Setup_1 with 16 core(s)...`) records what was
-actually used.
+task, so a change already reflected in the worker process's own
+environment takes effect on the very next task with no restart at all;
+the line the worker logs for each setup (`Analyzing Setup_1 with 16
+core(s)...`) records what was actually used.
+
+**Editing the underlying OS-level environment variable while the worker
+is already running is a different story, though — the tray's "Reset"
+alone will NOT pick it up.** Reset re-execs via `os.execv()` (§10.1),
+which has no `env` argument and so inherits this already-running
+process's existing environment exactly as it stood at launch — it
+re-imports this repo's own modules from disk (which is what makes it
+useful for code edits), but never re-reads the OS's environment
+variable store. A `setx`/System Properties/shell-profile edit made
+*after* the worker started needs the tray app fully exited (**Exit**,
+not Reset) and relaunched from a shell/session/Startup entry that
+already carries the new value.
 
 Setting `ANSYS_ANALYZE_CORES=aedt` passes `None` for cores, which makes
 PyAEDT skip the `pyaedt_config` machinery entirely and solve with
@@ -1026,8 +1038,8 @@ re-testing the whole pipeline against a small batch first.
 | Task appears in `failed/` immediately | Check `<task>.task.json.error.log` next to it — usually a bad `project_file` path, a `task_type` with no registered handler, or a project with no setup at all (`run_setups` needs at least one, but doesn't fail the task over a setup that exists and just didn't solve — see below). |
 | Task reports `success: true` but the client finds no sweep data | The adaptive pass solved and the frequency sweep did not. `success` is in practice just `setup.is_solved`, which queries the *adaptive* solution (`<setup> : LastAdaptive`) and says nothing about the sweeps under it — so a driven setup whose sweep failed still reports `true` and still files into `done/`. That's deliberate (the worker reports what it ran; the client's post-processing is what surfaces missing solution data — §5/§7). Check the HFSS message manager on the worker machine for the sweep's actual error. |
 | A setup didn't actually solve | This does NOT land the task in `failed/` — check the `success` flag for that setup name in the worker's own `result.json` (§5) first, or just let post-processing tell you (next row): it fails clearly, per-combo, the moment it tries to read solution data off an unsolved setup. |
-| Solves crawl / AEDT shows a `pyaedt_config` HPC configuration using 1 core | PyAEDT's `Setup.analyze()` default, not an AEDT setting — see §10.2. Worker versions ≥ 0.1.5 pass the real core count instead; on an older one, or to change it, set `ANSYS_ANALYZE_CORES` (§10, §10.2) and restart the worker (tray → Reset). |
-| AEDT complains about cores or HPC licensing after upgrading the worker | The worker now asks for every logical processor on the machine, which may be more than the HPC license grants. Set `ANSYS_ANALYZE_CORES` to the allowed number (or `aedt` to leave AEDT's own configuration alone) and restart the worker — §10.2. |
+| Solves crawl / AEDT shows a `pyaedt_config` HPC configuration using 1 core | PyAEDT's `Setup.analyze()` default, not an AEDT setting — see §10.2. Worker versions ≥ 0.1.5 pass the real core count instead; on an older one, or to change it, set `ANSYS_ANALYZE_CORES` (§10, §10.2) and **fully exit and relaunch** the worker -- tray → Reset alone won't pick up a newly-set/edited environment variable (§10.2). |
+| AEDT complains about cores or HPC licensing after upgrading the worker | The worker now asks for every logical processor on the machine, which may be more than the HPC license grants. Set `ANSYS_ANALYZE_CORES` to the allowed number (or `aedt` to leave AEDT's own configuration alone) and fully exit and relaunch the worker -- tray → Reset alone won't pick up the new value (§10.2). |
 | Worker can't connect to AEDT | Make sure the full AEDT session is already open on that machine before starting `run_service.py` — it attaches to an existing session (`new_desktop=False`), it does not launch one. If you just clicked Release, that's expected — it detaches on purpose; click Resume. |
 | Post-processing (client pipeline) finds no modes, or fails to reopen the project | Check the `success` flag in the worker's `result.json` for that setup first (§5) — post-processing will raise a clear "not solved" error for a setup that didn't, and that combo's `post_status` becomes `"failed"` without blocking the rest of the run (§9). If it did solve but extraction still fails, see §11's PyAEDT-version notes. |
 | "attempted relative import with no known parent package" | You ran a module inside `ansys_analyze_worker/` directly instead of via `ansys-analyze-worker` / `python -m ansys_analyze_worker.run_service` — see §10. |

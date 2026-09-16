@@ -71,6 +71,15 @@ class StubHfss:
 
 class RunSetupsHpcWiringTests(unittest.TestCase):
     def setUp(self):
+        # mock.patch.dict snapshots os.environ now and restores it
+        # verbatim in addCleanup (run even on failure/error) -- a plain
+        # `os.environ.pop(...)` in setUp alone only cleans the slate
+        # *before* each test, not after, so a value a test method sets
+        # (ANSYS_ANALYZE_CORES="8" below, for instance) would otherwise
+        # leak into every test that runs after it in the same process.
+        self._patcher = mock.patch.dict(os.environ, {}, clear=False)
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
         for var in (hpc.CORES_ENV_VAR, hpc.TASKS_ENV_VAR, hpc.GPUS_ENV_VAR):
             os.environ.pop(var, None)
         self.logs: list = []

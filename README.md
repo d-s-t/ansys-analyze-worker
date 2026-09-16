@@ -124,11 +124,17 @@ redeploy:
 |---|---|---|
 | `ANSYS_ANALYZE_CORES` | every logical processor | Cores per solve. A number caps it (e.g. to what your HPC license allows, or the physical core count); `aedt` leaves AEDT's own HPC configuration untouched -- but only if `ANSYS_ANALYZE_TASKS`/`_GPUS` are ALSO left unset (setting either one forces a rebuild that resets cores anyway; the worker detects that and falls cores back to every logical processor instead, with a warning). |
 | `ANSYS_ANALYZE_TASKS` | `1`, auto-distributed anyway | Solve tasks/engines. Rarely needed -- AEDT auto-distributes tasks regardless (`(Auto)` in the dialog). |
-| `ANSYS_ANALYZE_GPUS` | `0` (no GPU acceleration) | GPUs to use, where the solver and license support it. **Set this explicitly on any machine that solves with GPU acceleration** -- unlike tasks, there's no auto-distribution fallback, so leaving it unset does not inherit whatever AEDT's dialog already has configured. |
+| `ANSYS_ANALYZE_GPUS` | `0` (no GPU acceleration) | GPUs to use, where the solver and license support it. **Set this explicitly on any machine that solves with GPU acceleration** -- unlike tasks, there's no auto-distribution fallback, so leaving it unset means zero GPUs whenever cores is also being overridden (the default). The one exception is `ANSYS_ANALYZE_CORES=aedt` with tasks *also* left unset -- that combination skips this rebuild entirely and leaves the dialog's own GPU setting, whatever it is, untouched. |
 
-They're re-read for every task, so changing one and clicking the tray's
-**Reset** applies it without restarting anything by hand. Each solve
-logs what it used (`Analyzing Setup_1 with 16 core(s)...`).
+They're re-read for every task, so a change already reflected in the
+worker's own environment takes effect on the very next task with no
+restart at all. Editing the underlying *OS-level* environment variable
+while the worker is already running is a different story, though:
+clicking the tray's **Reset** alone will NOT pick it up (it re-execs the
+same process with its existing environment, not a freshly-read one --
+see §10.2 of the architecture doc) -- fully exiting the tray app and
+relaunching it is what's needed. Each solve logs what it used
+(`Analyzing Setup_1 with 16 core(s)...`).
 
 Run with `--no-tray` for a plain console service instead (useful for
 debugging, or running under a service manager that doesn't want a GUI) --
