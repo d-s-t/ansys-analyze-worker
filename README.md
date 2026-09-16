@@ -107,6 +107,35 @@ The actual scanning/analyzing work runs in its own child process, not on
 the tray's process -- see `docs/ARCHITECTURE.md` section 10.1 for why
 (short version: blocking AEDT calls used to freeze the tray solid).
 
+### How many cores it solves on
+
+By default the worker solves on **every logical processor** of the
+machine it runs on. This is worth knowing about because PyAEDT does not
+inherit AEDT's own HPC settings: `setup.analyze()` defaults to
+`cores=1` and writes its own `pyaedt_config` entry into "HPC and
+Analysis Options" to enforce it, so a worker that didn't pass the core
+count explicitly would solve single-threaded no matter what that dialog
+says (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §10.2).
+
+Override it per machine with environment variables -- no code change, no
+redeploy:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ANSYS_ANALYZE_CORES` | every logical processor | Cores per solve. A number caps it (e.g. to what your HPC license allows, or the physical core count); `aedt` leaves AEDT's own HPC configuration untouched -- but only if `ANSYS_ANALYZE_TASKS`/`_GPUS` are ALSO left unset (setting either one forces a rebuild that resets cores anyway; the worker detects that and falls cores back to every logical processor instead, with a warning -- or, on the rare machine where even that count can't be determined, falls back to PyAEDT's own template default of 4 instead, see `docs/ARCHITECTURE.md` §10.2). |
+| `ANSYS_ANALYZE_TASKS` | `1`, auto-distributed anyway | Solve tasks/engines. Rarely needed -- AEDT auto-distributes tasks regardless (`(Auto)` in the dialog). |
+| `ANSYS_ANALYZE_GPUS` | `0` (no GPU acceleration) | GPUs to use, where the solver and license support it. **Set this explicitly on any machine that solves with GPU acceleration** -- unlike tasks, there's no auto-distribution fallback, so leaving it unset means zero GPUs whenever cores is also being overridden (the default). The one exception is `ANSYS_ANALYZE_CORES=aedt` with tasks *also* left unset -- that combination skips this rebuild entirely and leaves the dialog's own GPU setting, whatever it is, untouched. |
+
+They're re-read for every task, so a change already reflected in the
+worker's own environment takes effect on the very next task with no
+restart at all. Editing the underlying *OS-level* environment variable
+while the worker is already running is a different story, though:
+clicking the tray's **Reset** alone will NOT pick it up (it re-execs the
+same process with its existing environment, not a freshly-read one --
+see §10.2 of the architecture doc) -- fully exiting the tray app and
+relaunching it is what's needed. Each solve logs what it used
+(`Analyzing Setup_1 with 16 core(s)...`).
+
 Run with `--no-tray` for a plain console service instead (useful for
 debugging, or running under a service manager that doesn't want a GUI) --
 that mode runs everything in a single process/thread, since there's no

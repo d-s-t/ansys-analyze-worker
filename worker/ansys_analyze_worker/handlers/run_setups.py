@@ -42,10 +42,18 @@ post-processing step is what surfaces missing solution data
 (ARCHITECTURE.md section 5/13). Verifying sweeps here would drag
 solution-type-specific knowledge back into the worker, which is exactly
 what section 6 of the architecture exists to prevent.
+
+How many cores each solve gets is NOT decided here -- see hpc.py, which
+also explains why `setup.analyze()` must never be called bare (its
+`cores` argument defaults to 1, and PyAEDT quietly overrides AEDT's
+"HPC and Analysis Options" with that). Default: every logical processor
+on the worker machine, overridable with `ANSYS_ANALYZE_CORES`.
 """
 from __future__ import annotations
 
 from typing import Any, Dict
+
+from ..hpc import describe_hpc_options, resolve_hpc_options
 
 
 def run(hfss, task: Dict[str, Any], log) -> Dict[str, Any]:
@@ -57,11 +65,17 @@ def run(hfss, task: Dict[str, Any], log) -> Dict[str, Any]:
             "existing ones, it never creates one itself."
         )
 
+    # Never call setup.analyze() bare: its cores/tasks/gpus arguments
+    # default to 1/1/0, and a truthy one makes PyAEDT override AEDT's
+    # "HPC and Analysis Options" with a generated `pyaedt_config` -- so
+    # the bare call pins every solve to a single core. See hpc.py.
+    hpc_options = resolve_hpc_options()
+
     result: Dict[str, Any] = {}
     for setup_name in setup_names:
         setup = hfss.get_setup(setup_name)
-        log(f"Analyzing {setup_name}...")
-        result[setup_name] = {"success": setup.analyze() or setup.is_solved}
+        log(f"Analyzing {setup_name} with {describe_hpc_options(hpc_options)}...")
+        result[setup_name] = {"success": setup.analyze(**hpc_options) or setup.is_solved}
 
     hfss.save_project(task["project_file"])
 

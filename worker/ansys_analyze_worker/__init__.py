@@ -16,4 +16,4 @@ To run the worker itself, see run_service.py's module docstring.
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.5"
