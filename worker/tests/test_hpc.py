@@ -222,6 +222,40 @@ class ResolveHpcOptionsTests(HpcOptionEnvTestCase):
         self.assertIn(hpc.CORES_ENV_VAR, " ".join(log.output))
         self.assertEqual(options, {"cores": None, "tasks": None, "gpus": None})
 
+    def test_undetectable_cpu_count_with_invalid_cores_is_correctly_attributed(self):
+        # Regression test: this "no tasks/gpus override" warning branch
+        # used to hardcode "isn't set to a specific number" even when
+        # ANSYS_ANALYZE_CORES WAS set, just to something invalid --
+        # exactly the misattribution bug already fixed in the sibling
+        # (tasks/gpus-set) branch, left standing here.
+        os.environ[hpc.CORES_ENV_VAR] = "banana"
+        with mock.patch.object(hpc.os, "cpu_count", return_value=None):
+            with self.assertLogs(hpc.logger, level="WARNING") as log:
+                options = hpc.resolve_hpc_options()
+        message = " ".join(log.output)
+        self.assertIn("was invalid", message)
+        self.assertNotIn("isn't set", message)
+        self.assertEqual(options, {"cores": None, "tasks": None, "gpus": None})
+
+    def test_deliberate_aedt_with_undetectable_cpu_count_does_not_warn(self):
+        # Regression test: ANSYS_ANALYZE_CORES=aedt with no tasks/gpus
+        # override is a deliberate, fully-honored request to use
+        # whatever's active in AEDT's dialog -- os.cpu_count() being
+        # undetectable is irrelevant to it (cores would be None either
+        # way). The "no override" warning above used to fire here too,
+        # telling the operator to "set ANSYS_ANALYZE_CORES explicitly"
+        # to undo the exact thing they explicitly asked for.
+        os.environ[hpc.CORES_ENV_VAR] = "aedt"
+        # unittest.TestCase.assertNoLogs() would be the natural fit here,
+        # but it's 3.10+ and this package declares `requires-python =
+        # ">=3.9"` -- mock.patch.object + assert_not_called() works the
+        # same way on 3.9 too.
+        with mock.patch.object(hpc.os, "cpu_count", return_value=None):
+            with mock.patch.object(hpc.logger, "warning") as warning:
+                options = hpc.resolve_hpc_options()
+        warning.assert_not_called()
+        self.assertEqual(options, {"cores": None, "tasks": None, "gpus": None})
+
     def test_warning_names_both_overriding_variables_when_both_are_set(self):
         # Regression test: the warning used to name only whichever of
         # tasks/gpus happened to be checked first, silently dropping the

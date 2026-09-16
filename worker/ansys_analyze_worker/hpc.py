@@ -182,7 +182,31 @@ def resolve_hpc_options() -> Dict[str, Optional[int]]:
     tasks = _resolve_env_option(TASKS_ENV_VAR)
     gpus = _resolve_env_option(GPUS_ENV_VAR)
 
-    if cores is None and not (tasks or gpus) and cpu_count is None:
+    if cores is None:
+        # Computed once and shared by both warning branches below,
+        # rather than each re-deriving its own judgment of why `cores`
+        # ended up `None` -- that duplication is exactly how this
+        # module's own history (see git log) ended up with the same
+        # misattribution bug fixed in one branch and left standing in
+        # the other. There's only one true reason at a time; say it once.
+        raw_cores = os.environ.get(CORES_ENV_VAR, "").strip()
+        cores_is_deliberate_aedt = bool(raw_cores) and _means_use_aedt_settings(raw_cores)
+        if not raw_cores:
+            cores_reason = f"{CORES_ENV_VAR} is unset and os.cpu_count() couldn't determine one"
+        elif cores_is_deliberate_aedt:
+            cores_reason = f"{CORES_ENV_VAR}={raw_cores!r} asked to leave it alone"
+        else:
+            # cores is None here despite the variable being set to
+            # something that doesn't mean "use AEDT settings" --
+            # _resolve_env_option() already warned about *that* (an
+            # unparseable/negative value) and fell back to
+            # `default=cpu_count`, which then turned out to be None too.
+            # Different cause from "unset"; say so, or an operator fixing
+            # a typo'd value would be sent looking for a variable that
+            # was never missing in the first place.
+            cores_reason = f"{CORES_ENV_VAR}={raw_cores!r} was invalid and os.cpu_count() couldn't determine one either"
+
+    if cores is None and not (tasks or gpus) and cpu_count is None and not cores_is_deliberate_aedt:
         # Nothing forced a pyaedt_config rebuild here (tasks/gpus are
         # both None too), so this isn't the silent-regression case the
         # branch below exists for -- passing cores=None with tasks/gpus
@@ -191,13 +215,18 @@ def resolve_hpc_options() -> Dict[str, Optional[int]]:
         # module docstring), which is a perfectly safe fallback. It's
         # just not the *documented* "every logical processor" default,
         # since that default couldn't be computed -- worth one line in
-        # the log so that divergence isn't a total surprise.
+        # the log so that divergence isn't a total surprise. Excluded
+        # when `cores_is_deliberate_aedt`: there, using the dialog's own
+        # settings IS the request, not an accidental fallback, so
+        # warning about it (and telling the operator to set
+        # ANSYS_ANALYZE_CORES to undo their own explicit choice) would
+        # be actively unhelpful noise.
         logger.warning(
-            "os.cpu_count() couldn't determine the logical processor count, and %s "
-            "isn't set to a specific number either -- this solve will use whatever HPC "
+            "cores resolved to None (%s) -- this solve will use whatever HPC "
             "configuration is already active in AEDT's dialog instead of the usual "
-            "'every logical processor' default. Set %s explicitly to avoid this.",
-            CORES_ENV_VAR,
+            "'every logical processor' default. Set %s to an explicit number to avoid "
+            "this.",
+            cores_reason,
             CORES_ENV_VAR,
         )
 
@@ -212,21 +241,6 @@ def resolve_hpc_options() -> Dict[str, Optional[int]]:
         overriding_vars = " and ".join(
             var for var, value in ((TASKS_ENV_VAR, tasks), (GPUS_ENV_VAR, gpus)) if value
         )
-        raw_cores = os.environ.get(CORES_ENV_VAR, "").strip()
-        if not raw_cores:
-            cores_reason = f"{CORES_ENV_VAR} is unset and os.cpu_count() couldn't determine one"
-        elif _means_use_aedt_settings(raw_cores):
-            cores_reason = f"{CORES_ENV_VAR}={raw_cores!r} asked to leave it alone"
-        else:
-            # cores is None here despite the variable being set to
-            # something that doesn't mean "use AEDT settings" --
-            # _resolve_env_option() already warned about *that* (an
-            # unparseable/negative value) and fell back to
-            # `default=cpu_count`, which then turned out to be None too.
-            # Different cause from "unset"; say so, or an operator fixing
-            # a typo'd value would be sent looking for a variable that
-            # was never missing in the first place.
-            cores_reason = f"{CORES_ENV_VAR}={raw_cores!r} was invalid and os.cpu_count() couldn't determine one either"
         if cpu_count is not None:
             # There IS a concrete core count available -- use it instead
             # of letting cores silently fall back to the template's 4,
