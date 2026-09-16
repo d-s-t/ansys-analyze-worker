@@ -60,6 +60,21 @@ class ResolveEnvOptionTests(HpcOptionEnvTestCase):
     def test_unset_returns_default(self):
         self.assertEqual(hpc._resolve_env_option(hpc.CORES_ENV_VAR, default=7), 7)
 
+    def test_explicit_raw_overrides_the_environment(self):
+        # A caller that already read+stripped the env var itself (as
+        # resolve_hpc_options() does, to describe *why* cores ended up
+        # the way it did) can hand that same string in via `raw=`
+        # instead of this function reading the variable again
+        # independently -- and `raw` wins even if the environment says
+        # something else, so the two can never disagree about which
+        # value is authoritative.
+        os.environ[hpc.CORES_ENV_VAR] = "16"
+        self.assertEqual(hpc._resolve_env_option(hpc.CORES_ENV_VAR, default=1, raw="8"), 8)
+
+    def test_raw_none_falls_back_to_reading_the_environment(self):
+        os.environ[hpc.CORES_ENV_VAR] = "16"
+        self.assertEqual(hpc._resolve_env_option(hpc.CORES_ENV_VAR, default=1, raw=None), 16)
+
     def test_empty_string_returns_default(self):
         os.environ[hpc.CORES_ENV_VAR] = "   "
         self.assertEqual(hpc._resolve_env_option(hpc.CORES_ENV_VAR, default=7), 7)

@@ -130,7 +130,7 @@ def _means_use_aedt_settings(raw: str) -> bool:
         return False
 
 
-def _resolve_env_option(env_var: str, default: Optional[int] = None) -> Optional[int]:
+def _resolve_env_option(env_var: str, default: Optional[int] = None, raw: Optional[str] = None) -> Optional[int]:
     """
     Read one integer HPC option from the environment.
 
@@ -138,8 +138,18 @@ def _resolve_env_option(env_var: str, default: Optional[int] = None) -> Optional
     something unusable, and `None` when it explicitly asks for AEDT's own
     settings. A bad value is a warning, never an exception: a typo in an
     environment variable must not take the whole worker down mid-queue.
+
+    `raw` lets a caller that already read+stripped `os.environ[env_var]`
+    for its own purposes (`resolve_hpc_options()`'s coupling-guard
+    warning, which needs to describe *why* a value came out the way it
+    did) hand that same string in, rather than have this function read
+    it again independently -- two readers of the same variable is
+    exactly how this module ended up with the same misattribution bug
+    fixed in one branch and left standing in a sibling one, twice.
+    Passing `None` (the default) reads it here as usual.
     """
-    raw = os.environ.get(env_var, "").strip()
+    if raw is None:
+        raw = os.environ.get(env_var, "").strip()
     if not raw:
         return default
     if _means_use_aedt_settings(raw):
@@ -189,18 +199,21 @@ def resolve_hpc_options() -> Dict[str, Optional[int]]:
     # play, "cores ended up None" and "os.cpu_count() ended up None" need
     # to be told apart to log something that's actually true (see below).
     cpu_count = os.cpu_count()
-    cores = _resolve_env_option(CORES_ENV_VAR, default=cpu_count)
+    # Read once and handed to _resolve_env_option() below, rather than
+    # having it read this same variable again independently -- two
+    # readers of one variable is exactly how this module ended up with
+    # the same misattribution bug fixed in one branch and left standing
+    # in a sibling one, twice (see git log). One read, one source of
+    # truth for "what the operator actually typed".
+    raw_cores = os.environ.get(CORES_ENV_VAR, "").strip()
+    cores = _resolve_env_option(CORES_ENV_VAR, default=cpu_count, raw=raw_cores)
     tasks = _resolve_env_option(TASKS_ENV_VAR)
     gpus = _resolve_env_option(GPUS_ENV_VAR)
 
     if cores is None:
         # Computed once and shared by both warning branches below,
         # rather than each re-deriving its own judgment of why `cores`
-        # ended up `None` -- that duplication is exactly how this
-        # module's own history (see git log) ended up with the same
-        # misattribution bug fixed in one branch and left standing in
-        # the other. There's only one true reason at a time; say it once.
-        raw_cores = os.environ.get(CORES_ENV_VAR, "").strip()
+        # ended up `None`.
         cores_is_deliberate_aedt = bool(raw_cores) and _means_use_aedt_settings(raw_cores)
         if not raw_cores:
             cores_reason = f"{CORES_ENV_VAR} is unset and os.cpu_count() couldn't determine one"
