@@ -211,9 +211,15 @@ def resolve_hpc_options() -> Dict[str, Optional[int]]:
     gpus = _resolve_env_option(GPUS_ENV_VAR)
 
     if cores is None:
-        # Computed once and shared by both warning branches below,
-        # rather than each re-deriving its own judgment of why `cores`
-        # ended up `None`.
+        # `cores_reason`/`cores_is_deliberate_aedt` are computed exactly
+        # once here, and every place that needs them is nested inside
+        # this same `if` block rather than living in sibling top-level
+        # `if cores is None and ...:` statements -- so there's no way
+        # for a later edit to reference them from outside the block
+        # where they're defined, and no second, independently-computed
+        # copy to drift out of sync with this one (both are exactly the
+        # kind of implicit coupling that produced this module's earlier
+        # misattribution bugs -- see git log).
         cores_is_deliberate_aedt = bool(raw_cores) and _means_use_aedt_settings(raw_cores)
         if not raw_cores:
             cores_reason = f"{CORES_ENV_VAR} is unset and os.cpu_count() couldn't determine one"
@@ -230,68 +236,73 @@ def resolve_hpc_options() -> Dict[str, Optional[int]]:
             # was never missing in the first place.
             cores_reason = f"{CORES_ENV_VAR}={raw_cores!r} was invalid and os.cpu_count() couldn't determine one either"
 
-    if cores is None and not (tasks or gpus) and cpu_count is None and not cores_is_deliberate_aedt:
-        # Nothing forced a pyaedt_config rebuild here (tasks/gpus are
-        # both None too), so this isn't the silent-regression case the
-        # branch below exists for -- passing cores=None with tasks/gpus
-        # also None makes PyAEDT skip pyaedt_config entirely and solve
-        # with whatever's already active in AEDT's dialog (see the
-        # module docstring), which is a perfectly safe fallback. It's
-        # just not the *documented* "every logical processor" default,
-        # since that default couldn't be computed -- worth one line in
-        # the log so that divergence isn't a total surprise. Excluded
-        # when `cores_is_deliberate_aedt`: there, using the dialog's own
-        # settings IS the request, not an accidental fallback, so
-        # warning about it (and telling the operator to set
-        # ANSYS_ANALYZE_CORES to undo their own explicit choice) would
-        # be actively unhelpful noise.
-        logger.warning(
-            "cores resolved to None (%s) -- this solve will use whatever HPC "
-            "configuration is already active in AEDT's dialog instead of the usual "
-            "'every logical processor' default. Set %s to an explicit number to avoid "
-            "this.",
-            cores_reason,
-            CORES_ENV_VAR,
-        )
-
-    if cores is None and (tasks or gpus):
-        # "cores=aedt" (leave the dialog's core count alone), OR cores
-        # simply defaulting to an undetectable os.cpu_count(), can't
-        # actually be honored once tasks/gpus asks PyAEDT to rebuild the
-        # HPC config anyway -- see the module docstring. Left as None,
-        # cores would silently fall back to the *template's* NumCores=4
-        # instead of the dialog's real value, which is exactly the kind
-        # of silent under-utilization this module exists to prevent.
-        overriding_vars = " and ".join(
-            var for var, value in ((TASKS_ENV_VAR, tasks), (GPUS_ENV_VAR, gpus)) if value
-        )
-        if cpu_count is not None:
-            # There IS a concrete core count available -- use it instead
-            # of letting cores silently fall back to the template's 4,
-            # same as the ordinary "unset" default would.
-            logger.warning(
-                "cores resolved to None (%s), but %s is also set -- PyAEDT can't leave "
-                "cores untouched while overriding tasks/gpus (either one forces a full "
-                "HPC config rebuild from PyAEDT's own template, which would silently "
-                "reset cores to that template's default of 4 instead). Falling back "
-                "cores to every logical processor (%d) instead.",
-                cores_reason,
-                overriding_vars,
-                cpu_count,
+        if tasks or gpus:
+            # "cores=aedt" (leave the dialog's core count alone), OR
+            # cores simply defaulting to an undetectable os.cpu_count(),
+            # can't actually be honored once tasks/gpus asks PyAEDT to
+            # rebuild the HPC config anyway -- see the module docstring.
+            # Left as None, cores would silently fall back to the
+            # *template's* NumCores=4 instead of the dialog's real
+            # value, which is exactly the kind of silent
+            # under-utilization this module exists to prevent.
+            overriding_vars = " and ".join(
+                var for var, value in ((TASKS_ENV_VAR, tasks), (GPUS_ENV_VAR, gpus)) if value
             )
-            cores = cpu_count
-        else:
-            # No concrete core count to fall back to either -- there's
-            # nothing left to do but say plainly what PyAEDT will
-            # actually use, rather than claim a fix that didn't happen.
+            if cpu_count is not None:
+                # There IS a concrete core count available -- use it
+                # instead of letting cores silently fall back to the
+                # template's 4, same as the ordinary "unset" default
+                # would.
+                logger.warning(
+                    "cores resolved to None (%s), but %s is also set -- PyAEDT can't "
+                    "leave cores untouched while overriding tasks/gpus (either one "
+                    "forces a full HPC config rebuild from PyAEDT's own template, which "
+                    "would silently reset cores to that template's default of 4 "
+                    "instead). Falling back cores to every logical processor (%d) "
+                    "instead.",
+                    cores_reason,
+                    overriding_vars,
+                    cpu_count,
+                )
+                cores = cpu_count
+            else:
+                # No concrete core count to fall back to either --
+                # there's nothing left to do but say plainly what
+                # PyAEDT will actually use, rather than claim a fix
+                # that didn't happen.
+                logger.warning(
+                    "cores resolved to None (%s), and the logical processor count "
+                    "couldn't be determined either, while %s is also set -- PyAEDT "
+                    "will rebuild the HPC config from its own bundled template, so "
+                    "this solve will silently run on that template's default of 4 "
+                    "cores, not the dialog's real value. Set %s to an explicit number "
+                    "to avoid this.",
+                    cores_reason,
+                    overriding_vars,
+                    CORES_ENV_VAR,
+                )
+        elif cpu_count is None and not cores_is_deliberate_aedt:
+            # Nothing forced a pyaedt_config rebuild here (tasks/gpus
+            # are both None too), so this isn't the silent-regression
+            # case the branch above exists for -- passing cores=None
+            # with tasks/gpus also None makes PyAEDT skip pyaedt_config
+            # entirely and solve with whatever's already active in
+            # AEDT's dialog (see the module docstring), which is a
+            # perfectly safe fallback. It's just not the *documented*
+            # "every logical processor" default, since that default
+            # couldn't be computed -- worth one line in the log so that
+            # divergence isn't a total surprise. Excluded when
+            # `cores_is_deliberate_aedt`: there, using the dialog's own
+            # settings IS the request, not an accidental fallback, so
+            # warning about it (and telling the operator to set
+            # ANSYS_ANALYZE_CORES to undo their own explicit choice)
+            # would be actively unhelpful noise.
             logger.warning(
-                "cores resolved to None (%s), and the logical processor count "
-                "couldn't be determined either, while %s is also set -- PyAEDT will "
-                "rebuild the HPC config from its own bundled template, so this solve "
-                "will silently run on that template's default of 4 cores, not the "
-                "dialog's real value. Set %s to an explicit number to avoid this.",
+                "cores resolved to None (%s) -- this solve will use whatever HPC "
+                "configuration is already active in AEDT's dialog instead of the usual "
+                "'every logical processor' default. Set %s to an explicit number to "
+                "avoid this.",
                 cores_reason,
-                overriding_vars,
                 CORES_ENV_VAR,
             )
 
