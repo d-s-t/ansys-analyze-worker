@@ -92,11 +92,31 @@ CORES_ENV_VAR = "ANSYS_ANALYZE_CORES"
 TASKS_ENV_VAR = "ANSYS_ANALYZE_TASKS"
 GPUS_ENV_VAR = "ANSYS_ANALYZE_GPUS"
 
-# Values (case-insensitive) that mean "pass None, i.e. don't let PyAEDT
-# write a pyaedt_config at all -- solve with AEDT's own active HPC
-# configuration". `0` is spelled out here too since "zero cores" has no
-# other sensible reading.
+# Non-numeric spellings (case-insensitive) that mean "pass None, i.e.
+# don't let PyAEDT write a pyaedt_config at all -- solve with AEDT's own
+# active HPC configuration". Any numeric spelling of zero ("0", "00",
+# "+0", "-0", ...) means the same thing -- see _means_use_aedt_settings()
+# below, which is what actually decides this everywhere it matters.
 USE_AEDT_SETTINGS_VALUES = frozenset({"aedt", "auto", "default", "0"})
+
+
+def _means_use_aedt_settings(raw: str) -> bool:
+    """
+    True if the (already-stripped) raw string asks to leave AEDT's own
+    HPC settings alone -- one of the canonical spellings above, or any
+    numeric spelling of zero. Split out from `_resolve_env_option()` so
+    `resolve_hpc_options()`'s coupling-guard warning (below) can ask the
+    exact same question when deciding how to describe why `cores` ended
+    up `None`, instead of re-deriving its own, slightly different
+    judgment call and risking the two disagreeing about what a given
+    value meant.
+    """
+    if raw.lower() in USE_AEDT_SETTINGS_VALUES:
+        return True
+    try:
+        return int(raw) == 0
+    except ValueError:
+        return False
 
 
 def _resolve_env_option(env_var: str, default: Optional[int] = None) -> Optional[int]:
@@ -111,7 +131,7 @@ def _resolve_env_option(env_var: str, default: Optional[int] = None) -> Optional
     raw = os.environ.get(env_var, "").strip()
     if not raw:
         return default
-    if raw.lower() in USE_AEDT_SETTINGS_VALUES:
+    if _means_use_aedt_settings(raw):
         return None
 
     try:
@@ -122,7 +142,9 @@ def _resolve_env_option(env_var: str, default: Optional[int] = None) -> Optional
     if value < 0:
         logger.warning("%s=%r is negative -- ignoring it and using %r instead.", env_var, raw, default)
         return default
-    return value or None
+    # value == 0 is impossible here: _means_use_aedt_settings() already
+    # caught every spelling that parses to zero and returned None above.
+    return value
 
 
 def resolve_hpc_options() -> Dict[str, Optional[int]]:
@@ -149,6 +171,25 @@ def resolve_hpc_options() -> Dict[str, Optional[int]]:
     tasks = _resolve_env_option(TASKS_ENV_VAR)
     gpus = _resolve_env_option(GPUS_ENV_VAR)
 
+    if cores is None and not (tasks or gpus) and cpu_count is None:
+        # Nothing forced a pyaedt_config rebuild here (tasks/gpus are
+        # both None too), so this isn't the silent-regression case the
+        # branch below exists for -- passing cores=None with tasks/gpus
+        # also None makes PyAEDT skip pyaedt_config entirely and solve
+        # with whatever's already active in AEDT's dialog (see the
+        # module docstring), which is a perfectly safe fallback. It's
+        # just not the *documented* "every logical processor" default,
+        # since that default couldn't be computed -- worth one line in
+        # the log so that divergence isn't a total surprise.
+        logger.warning(
+            "os.cpu_count() couldn't determine the logical processor count, and %s "
+            "isn't set to a specific number either -- this solve will use whatever HPC "
+            "configuration is already active in AEDT's dialog instead of the usual "
+            "'every logical processor' default. Set %s explicitly to avoid this.",
+            CORES_ENV_VAR,
+            CORES_ENV_VAR,
+        )
+
     if cores is None and (tasks or gpus):
         # "cores=aedt" (leave the dialog's core count alone), OR cores
         # simply defaulting to an undetectable os.cpu_count(), can't
@@ -161,19 +202,20 @@ def resolve_hpc_options() -> Dict[str, Optional[int]]:
             var for var, value in ((TASKS_ENV_VAR, tasks), (GPUS_ENV_VAR, gpus)) if value
         )
         raw_cores = os.environ.get(CORES_ENV_VAR, "").strip()
-        if raw_cores.lower() in USE_AEDT_SETTINGS_VALUES:
+        if not raw_cores:
+            cores_reason = f"{CORES_ENV_VAR} is unset and os.cpu_count() couldn't determine one"
+        elif _means_use_aedt_settings(raw_cores):
             cores_reason = f"{CORES_ENV_VAR}={raw_cores!r} asked to leave it alone"
-        elif raw_cores:
+        else:
             # cores is None here despite the variable being set to
-            # something -- _resolve_env_option() already warned about
-            # *that* (an unparseable/negative value) and fell back to
+            # something that doesn't mean "use AEDT settings" --
+            # _resolve_env_option() already warned about *that* (an
+            # unparseable/negative value) and fell back to
             # `default=cpu_count`, which then turned out to be None too.
             # Different cause from "unset"; say so, or an operator fixing
             # a typo'd value would be sent looking for a variable that
             # was never missing in the first place.
             cores_reason = f"{CORES_ENV_VAR}={raw_cores!r} was invalid and os.cpu_count() couldn't determine one either"
-        else:
-            cores_reason = f"{CORES_ENV_VAR} is unset and os.cpu_count() couldn't determine one"
         if cpu_count is not None:
             # There IS a concrete core count available -- use it instead
             # of letting cores silently fall back to the template's 4,

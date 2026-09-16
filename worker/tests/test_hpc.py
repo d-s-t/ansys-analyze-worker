@@ -36,6 +36,26 @@ class HpcOptionEnvTestCase(unittest.TestCase):
         self.addCleanup(self._patcher.stop)
 
 
+class MeansUseAedtSettingsTests(unittest.TestCase):
+    def test_canonical_spellings(self):
+        for spelling in ("aedt", "AEDT", "auto", "AUTO", "default", "DEFAULT", "0"):
+            with self.subTest(spelling=spelling):
+                self.assertTrue(hpc._means_use_aedt_settings(spelling))
+
+    def test_other_zero_spellings(self):
+        for spelling in ("00", "+0", "-0", "000"):
+            with self.subTest(spelling=spelling):
+                self.assertTrue(hpc._means_use_aedt_settings(spelling))
+
+    def test_nonzero_numbers_are_not_the_sentinel(self):
+        for spelling in ("1", "16", "-4"):
+            with self.subTest(spelling=spelling):
+                self.assertFalse(hpc._means_use_aedt_settings(spelling))
+
+    def test_garbage_is_not_the_sentinel(self):
+        self.assertFalse(hpc._means_use_aedt_settings("banana"))
+
+
 class ResolveEnvOptionTests(HpcOptionEnvTestCase):
     def test_unset_returns_default(self):
         self.assertEqual(hpc._resolve_env_option(hpc.CORES_ENV_VAR, default=7), 7)
@@ -119,11 +139,6 @@ class ResolveHpcOptionsTests(HpcOptionEnvTestCase):
                 options = hpc.resolve_hpc_options()
         self.assertEqual(options, {"cores": 8, "tasks": 4, "gpus": None})
 
-    def test_undetectable_cpu_count_with_no_overrides_leaves_cores_none(self):
-        with mock.patch.object(hpc.os, "cpu_count", return_value=None):
-            options = hpc.resolve_hpc_options()
-        self.assertIsNone(options["cores"])
-
     def test_undetectable_cpu_count_combined_with_gpus_warns_but_cannot_fix_cores(self):
         # Regression test: the coupling-bug fallback used to recompute
         # os.cpu_count() as ITS "fallback" value too, so when cpu_count()
@@ -178,6 +193,34 @@ class ResolveHpcOptionsTests(HpcOptionEnvTestCase):
         self.assertIn("was invalid", message)
         self.assertNotIn("is unset", message)
         self.assertIsNone(options["cores"])
+
+    def test_non_canonical_zero_spelling_is_correctly_attributed(self):
+        # Regression test: "00"/"+0"/"-0" all parse to zero (meaning
+        # "use AEDT's own settings", same as the canonical "0"), but
+        # aren't literally in USE_AEDT_SETTINGS_VALUES -- the warning
+        # used to call these "invalid" even though they parsed fine and
+        # were honored correctly; it just described why incorrectly.
+        for spelling in ("00", "+0", "-0"):
+            with self.subTest(spelling=spelling):
+                os.environ[hpc.CORES_ENV_VAR] = spelling
+                os.environ[hpc.GPUS_ENV_VAR] = "2"
+                with mock.patch.object(hpc.os, "cpu_count", return_value=16):
+                    with self.assertLogs(hpc.logger, level="WARNING") as log:
+                        options = hpc.resolve_hpc_options()
+                message = " ".join(log.output)
+                self.assertIn("asked to leave it alone", message)
+                self.assertNotIn("was invalid", message)
+                self.assertEqual(options, {"cores": 16, "tasks": None, "gpus": 2})
+
+    def test_undetectable_cpu_count_with_no_override_still_warns(self):
+        # Regression test: this combination used to log nothing at all,
+        # silently diverging from the documented "every logical
+        # processor" default with no trace in the log.
+        with mock.patch.object(hpc.os, "cpu_count", return_value=None):
+            with self.assertLogs(hpc.logger, level="WARNING") as log:
+                options = hpc.resolve_hpc_options()
+        self.assertIn(hpc.CORES_ENV_VAR, " ".join(log.output))
+        self.assertEqual(options, {"cores": None, "tasks": None, "gpus": None})
 
     def test_warning_names_both_overriding_variables_when_both_are_set(self):
         # Regression test: the warning used to name only whichever of
