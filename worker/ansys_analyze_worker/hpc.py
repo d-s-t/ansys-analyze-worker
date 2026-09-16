@@ -41,6 +41,22 @@ Options" dialog. That's what `ANSYS_ANALYZE_CORES=aedt` selects, for a
 machine whose HPC options are already tuned by hand (or by an HPC pack
 license's own configuration) and should be left alone.
 
+**A `None` for `tasks`/`gpus` alone is a different, narrower thing --
+it does NOT mean "keep AEDT's active setting" once `cores` is set (the
+default).** `set_custom_hpc_options()` always starts from a *fresh copy*
+of PyAEDT's bundled template, never from whatever config is currently
+active, and only overwrites the fields it was actually given; a field
+passed as `None` is simply skipped, so it keeps the *template's* value
+(`NumEngines=1`, `NumGPUs=0`), not the dialog's. For `tasks` this is
+usually moot -- the template ships `UseAutoSettings=true`, so AEDT
+distributes tasks itself regardless of `NumEngines`. For `gpus` it is
+NOT moot: leaving `ANSYS_ANALYZE_GPUS` unset means every solve runs with
+**zero GPUs**, same as it always did (a bare `setup.analyze()` passed
+`gpus=0` too), but now there is finally a way to ask for GPUs -- a
+machine that solves with GPU acceleration must set `ANSYS_ANALYZE_GPUS`
+explicitly, or set `ANSYS_ANALYZE_CORES=aedt` to bypass `pyaedt_config`
+entirely and inherit the dialog's config (GPUs included) untouched.
+
 A note on core counts and licensing: `os.cpu_count()` counts *logical*
 processors (hyperthreading included), and AEDT's HPC licensing caps how
 many cores a solve may actually use. If the message manager starts
@@ -104,9 +120,9 @@ def resolve_hpc_options() -> Dict[str, Optional[int]]:
 
     | Variable | Default | Meaning |
     |---|---|---|
-    | `ANSYS_ANALYZE_CORES` | every logical processor | Cores for the solve. `aedt` (or `auto`/`default`/`0`) leaves AEDT's own HPC configuration untouched. |
-    | `ANSYS_ANALYZE_TASKS` | AEDT's own | Solve tasks/engines (`NumEngines`). Rarely worth setting: the ACF template ships `UseAutoSettings=true`, so AEDT distributes tasks itself -- that's the `(Auto)` in the dialog. |
-    | `ANSYS_ANALYZE_GPUS` | AEDT's own | GPUs to use, for a solver and license that support GPU acceleration. |
+    | `ANSYS_ANALYZE_CORES` | every logical processor | Cores for the solve. `aedt` (or `auto`/`default`/`0`) leaves AEDT's own HPC configuration completely untouched (all three below too). |
+    | `ANSYS_ANALYZE_TASKS` | PyAEDT's template default (`1`, but auto-distributed anyway) | Solve tasks/engines (`NumEngines`). Rarely worth setting: the ACF template ships `UseAutoSettings=true`, so AEDT distributes tasks itself regardless -- that's the `(Auto)` in the dialog. |
+    | `ANSYS_ANALYZE_GPUS` | PyAEDT's template default (`0`, i.e. no GPU acceleration) | GPUs to use. Unlike `tasks`, there is no auto-distribution fallback for this one -- set it explicitly on any machine that should solve with GPU acceleration, since leaving it unset does NOT inherit whatever AEDT's dialog already has configured (see the module docstring above). |
     """
     return {
         # os.cpu_count() can return None (no way to determine it), which

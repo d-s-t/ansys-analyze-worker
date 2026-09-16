@@ -122,9 +122,9 @@ redeploy:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ANSYS_ANALYZE_CORES` | every logical processor | Cores per solve. A number caps it (e.g. to what your HPC license allows, or the physical core count); `aedt` leaves AEDT's own HPC configuration untouched. |
-| `ANSYS_ANALYZE_TASKS` | AEDT's own | Solve tasks/engines. Rarely needed -- AEDT auto-distributes tasks (`(Auto)` in the dialog). |
-| `ANSYS_ANALYZE_GPUS` | AEDT's own | GPUs to use, where the solver and license support it. |
+| `ANSYS_ANALYZE_CORES` | every logical processor | Cores per solve. A number caps it (e.g. to what your HPC license allows, or the physical core count); `aedt` leaves AEDT's own HPC configuration completely untouched (all three below too). |
+| `ANSYS_ANALYZE_TASKS` | `1`, auto-distributed anyway | Solve tasks/engines. Rarely needed -- AEDT auto-distributes tasks regardless (`(Auto)` in the dialog). |
+| `ANSYS_ANALYZE_GPUS` | `0` (no GPU acceleration) | GPUs to use, where the solver and license support it. **Set this explicitly on any machine that solves with GPU acceleration** -- unlike tasks, there's no auto-distribution fallback, so leaving it unset does not inherit whatever AEDT's dialog already has configured. |
 
 They're re-read for every task, so changing one and clicking the tray's
 **Reset** applies it without restarting anything by hand. Each solve
