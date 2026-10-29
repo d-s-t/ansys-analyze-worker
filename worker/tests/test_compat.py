@@ -20,6 +20,7 @@ needed:
 """
 from __future__ import annotations
 
+import os
 import socket
 import sys
 import types
@@ -155,6 +156,143 @@ class CheckPsutilListenStatusTests(unittest.TestCase):
         with mock.patch.object(psutil, "Process", side_effect=psutil.AccessDenied()):
             with self.assertLogs(compat.logger, level="WARNING"):
                 self.assertIsNone(compat.check_psutil_listen_status())
+
+
+def _fake_pyaedt(desktop_class):
+    """sys.modules entries that make `from ansys.aedt.core.desktop import Desktop` give `desktop_class`."""
+    modules = {}
+    for name in ("ansys", "ansys.aedt", "ansys.aedt.core", "ansys.aedt.core.desktop"):
+        module = types.ModuleType(name)
+        module.__path__ = []
+        modules[name] = module
+    modules["ansys.aedt.core.desktop"].Desktop = desktop_class
+    return modules
+
+
+class SilenceFailedDesktopCleanupTests(unittest.TestCase):
+    """PyAEDT's Desktop.__del__ must not run for a Desktop whose constructor failed (odesktop is None)."""
+
+    def setUp(self):
+        self.released = []
+        released = self.released
+
+        class Desktop:
+            def __init__(self, odesktop):
+                self._odesktop = odesktop
+
+            @property
+            def odesktop(self):
+                if self._odesktop == "explode":
+                    raise RuntimeError("property blew up")
+                return self._odesktop
+
+            def __del__(self):
+                released.append(self._odesktop)
+
+        self.Desktop = Desktop
+        patcher = mock.patch.dict(sys.modules, _fake_pyaedt(Desktop))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def drop(self, odesktop):
+        """Build a Desktop and let it be garbage collected, so __del__ runs once, as it does for real."""
+        import gc
+
+        desktop = self.Desktop(odesktop)
+        del desktop
+        gc.collect()
+
+    def test_a_desktop_that_never_got_a_session_is_not_released(self):
+        self.assertTrue(compat.silence_failed_desktop_cleanup())
+        self.drop(None)
+        self.assertEqual(self.released, [])
+
+    def test_a_desktop_with_a_session_is_released_exactly_as_before(self):
+        compat.silence_failed_desktop_cleanup()
+        self.drop("session")
+        self.assertEqual(self.released, ["session"])
+
+    def test_an_odesktop_property_that_raises_is_skipped_not_raised(self):
+        compat.silence_failed_desktop_cleanup()
+        self.drop("explode")
+        self.assertEqual(self.released, [])
+
+    def test_applying_twice_does_not_wrap_twice(self):
+        self.assertTrue(compat.silence_failed_desktop_cleanup())
+        guard = self.Desktop.__dict__["__del__"]
+        self.assertTrue(compat.silence_failed_desktop_cleanup())
+        self.assertIs(self.Desktop.__dict__["__del__"], guard)
+        self.drop("session")
+        self.assertEqual(self.released, ["session"])
+
+    def test_a_desktop_without_del_is_left_alone(self):
+        del self.Desktop.__del__
+        self.assertFalse(compat.silence_failed_desktop_cleanup())
+
+    def test_pyaedt_not_importable_returns_false_with_a_warning(self):
+        with mock.patch.dict(sys.modules, {"ansys.aedt.core.desktop": None}):
+            with self.assertLogs(compat.logger, level="WARNING"):
+                self.assertFalse(compat.silence_failed_desktop_cleanup())
+
+
+class WorkerWiringTests(unittest.TestCase):
+    """Worker._ensure_desktop applies both PyAEDT workarounds before it builds the Desktop."""
+
+    def test_workarounds_are_applied_before_desktop_is_constructed(self):
+        import tempfile
+
+        from ansys_analyze_common.queue_common import QueuePaths
+        from ansys_analyze_worker.worker import Worker
+
+        order = []
+
+        class Desktop:
+            def __init__(self, **kwargs):
+                order.append(("Desktop", kwargs))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = Worker(QueuePaths(tmp), aedt_version="2025.2", non_graphical=True)
+            with mock.patch.dict(sys.modules, _fake_pyaedt(Desktop)), \
+                    mock.patch.object(compat, "apply_psutil_listen_fix", lambda: order.append("psutil")), \
+                    mock.patch.object(compat, "silence_failed_desktop_cleanup", lambda: order.append("del-guard")):
+                sys.modules["ansys.aedt.core"].Desktop = Desktop
+                self.assertIsInstance(worker._ensure_desktop(), Desktop)
+        self.assertEqual(order, ["psutil", "del-guard",
+                                 ("Desktop", {"version": "2025.2", "new_desktop": False, "non_graphical": True})])
+
+
+def _real_pyaedt_without_aedt():
+    """Real PyAEDT importable, and no AEDT installed (so building a Desktop fails before it can attach to anything)."""
+    if any(name.startswith(("ANSYSEM_ROOT", "AWP_ROOT")) for name in os.environ):
+        return False
+    try:
+        import ansys.aedt.core  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+@unittest.skipUnless(_real_pyaedt_without_aedt(), "needs real PyAEDT on a machine with no AEDT installed")
+class RealPyaedtDesktopTests(unittest.TestCase):
+    """The reported log noise, against the real class. Skipped wherever AEDT is installed, so it can never attach to a session."""
+
+    def test_a_failed_desktop_leaves_no_cleanup_traceback(self):
+        import gc
+
+        from ansys.aedt.core import Desktop
+
+        self.addCleanup(setattr, Desktop, "__del__", Desktop.__dict__["__del__"])
+        unraisable = []
+        previous_hook = sys.unraisablehook
+        sys.unraisablehook = unraisable.append
+        self.addCleanup(setattr, sys, "unraisablehook", previous_hook)
+
+        compat.silence_failed_desktop_cleanup()
+        with self.assertRaises(Exception):
+            Desktop(version="2025.2", new_desktop=False, non_graphical=True)
+        gc.collect()
+
+        self.assertEqual([u.exc_value for u in unraisable], [])
 
 
 @unittest.skipUnless(psutil is not None and sys.platform == "win32", "needs psutil on Windows")

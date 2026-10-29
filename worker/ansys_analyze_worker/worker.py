@@ -131,6 +131,7 @@ class Worker:
 
         # PyAEDT finds a running AEDT by a LISTEN socket; see compat.py.
         compat.apply_psutil_listen_fix()
+        compat.silence_failed_desktop_cleanup()
         logger.info("Connecting to an already-open AEDT session...")
         self._desktop = Desktop(
             version=self.aedt_version,
