@@ -33,6 +33,7 @@ from typing import Optional
 
 from ansys_analyze_common.queue_common import QueuePaths, recover_orphaned_tasks, resolve_path, validate_task
 
+from . import compat
 from .handlers import get_handler
 from . import field_exports
 
@@ -128,6 +129,8 @@ class Worker:
             return self._desktop
         from ansys.aedt.core import Desktop
 
+        # PyAEDT finds a running AEDT by a LISTEN socket; see compat.py.
+        compat.apply_psutil_listen_fix()
         logger.info("Connecting to an already-open AEDT session...")
         self._desktop = Desktop(
             version=self.aedt_version,
@@ -157,6 +160,8 @@ class Worker:
 
     # -- main loop ------------------------------------------------------------
     def run_forever(self) -> None:
+        compat.apply_psutil_listen_fix()
+        compat.check_psutil_listen_status()
         recovered = recover_orphaned_tasks(self.queue)
         if recovered:
             logger.info(
