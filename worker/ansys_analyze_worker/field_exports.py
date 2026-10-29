@@ -16,8 +16,18 @@ Everything else stays client-side; see docs/ARCHITECTURE.md sections 7 and
 setup creation. The client creates the setup (with the frequency or mode it
 wants), reads the `.fld` files back, and does all the analysis. The worker
 stays solution-type agnostic: `solution` and `intrinsics` are passed to AEDT
-as given (`Freq`/`Phase` for driven runs, `Mode`/`Phase` for eigenmode), and
+as given (`Freq`/`Phase` for a driven run; see below for eigenmode), and
 `expression` is a calculator recipe rather than a list of known quantities.
+
+**Eigenmode is not verified.** The issue proposed `Mode`/`Phase` intrinsics
+for it, but on real AEDT every export with `Mode` failed ("Script macro
+error"), while the identical call works on a driven design. PyAEDT 1.0.0
+lists only `Phase` as an intrinsic of an Eigenmode design, so `Mode` is
+probably not accepted; how AEDT selects a mode for a field export has not
+been established. A failed export therefore records what was sent
+(`export_on_grid_args`) and what the design declares (`design`: its
+solutions and intrinsics), to be compared with a script recorded from a
+manual export in AEDT.
 
 **Failure policy.** An export that fails is recorded as
 `{"success": False, "error": ...}` and neither fails the task nor skips the
@@ -73,14 +83,22 @@ def run(hfss, task: Dict[str, Any], log) -> Dict[str, Any]:
             results[name] = _export_one(hfss, entry, task["output_dir"])
         except Exception as exc:
             logger.warning("Field export %s failed: %s", name, exc, exc_info=True)
+            design = _design_description(hfss)
             error = f"{type(exc).__name__}: {exc}"
-            hint = _unknown_solution_hint(hfss, entry["solution"])
-            if hint:
-                error += f" ({hint})"
+            hints = _failure_hints(entry, design)
+            if hints:
+                error += " (" + "; ".join(hints) + ")"
             failure: Dict[str, Any] = {"success": False, "error": error}
             new_messages = _aedt_error_messages(hfss)[len(messages_before):]
             if new_messages:
                 failure["aedt_messages"] = new_messages
+            # AEDT's own error is just "Failed to execute gRPC AEDT command: ExportOnGrid", so say
+            # exactly what was sent and what the design declares -- the two things to compare.
+            failure["export_on_grid_args"] = _export_on_grid_args(entry, _relative_file(name))
+            if design:
+                failure["design"] = design
+            logger.warning("Field export %s: ExportOnGrid arguments %s; design %s", name,
+                           failure["export_on_grid_args"], design or "unreadable")
             results[name] = failure
     return results
 
@@ -98,9 +116,6 @@ def _export_one(hfss, entry: Dict[str, Any], output_dir: str) -> Dict[str, Any]:
     if sources:
         if hfss.edit_sources(dict(sources)) is False:
             raise RuntimeError("edit_sources failed")
-
-    grid = entry["grid"]
-    units = grid.get("units", FIELD_EXPORT_DEFAULT_UNITS)
 
     # Call the fields reporter directly rather than through
     # hfss.post.export_field_file_on_grid: in PyAEDT 1.0.0 that helper's
@@ -126,11 +141,30 @@ def _export_one(hfss, entry: Dict[str, Any], output_dir: str) -> Dict[str, Any]:
             # AEDT's own message is just "Failed to execute gRPC AEDT command: CalcOp".
             raise RuntimeError(f"calculator operation {operation!r} failed: {exc}") from exc
 
+    reporter.ExportOnGrid(*_export_on_grid_args(entry, out_file))
+
+    # AEDT does not always raise when it refuses (the Student mesh limit only
+    # shows up as a message), so the file itself is the evidence.
+    if not os.path.exists(out_file):
+        raise RuntimeError("AEDT reported no error but wrote no file")
+    points = _count_points(out_file)
+    if points == 0:
+        raise RuntimeError("the exported file has no data rows")
+    return {"success": True, "file": _relative_file(name), "points": points}
+
+
+def _relative_file(name: str) -> str:
+    return f"{FIELDS_SUBDIR}/{name}.fld"
+
+
+def _export_on_grid_args(entry: Dict[str, Any], out_file: str) -> list:
+    """The ten positional arguments of `ofieldsreporter.ExportOnGrid` for this entry."""
+    grid = entry["grid"]
+    units = grid.get("units", FIELD_EXPORT_DEFAULT_UNITS)
     intrinsics: List[Any] = []
     for key, value in (entry.get("intrinsics") or {}).items():
         intrinsics.extend([f"{key}:=", str(value)])
-
-    reporter.ExportOnGrid(
+    return [
         out_file,
         _with_units(grid["start"], units),
         _with_units(grid["stop"], units),
@@ -142,34 +176,52 @@ def _export_one(hfss, entry: Dict[str, Any], output_dir: str) -> Dict[str, Any]:
         grid.get("type", "Cartesian"),
         [f"0{units}"] * 3,
         False,
-    )
-
-    # AEDT does not always raise when it refuses (the Student mesh limit only
-    # shows up as a message), so the file itself is the evidence.
-    if not os.path.exists(out_file):
-        raise RuntimeError("AEDT reported no error but wrote no file")
-    points = _count_points(out_file)
-    if points == 0:
-        raise RuntimeError("the exported file has no data rows")
-    return {"success": True, "file": f"{FIELDS_SUBDIR}/{name}.fld", "points": points}
+    ]
 
 
-def _unknown_solution_hint(hfss, solution: str) -> str:
+def _design_description(hfss) -> Dict[str, Any]:
     """
-    For a failed export: if `solution` isn't among the design's solutions,
-    say so and list them -- AEDT's own error for a wrong solution name is
-    just "Failed to execute gRPC AEDT command: ExportOnGrid". Only used
-    after a failure, never to refuse an export up front, so a valid name
-    that PyAEDT's list happens to omit can't be blocked. "" when the list
-    can't be read, is empty, or contains the solution.
+    What the open design declares, for a failed export to be compared with
+    what was asked for: `solutions` (PyAEDT's `existing_analysis_sweeps`,
+    "<setup> : <sweep>") and `intrinsics` (names PyAEDT lists for the
+    design's solution type -- Freq/Phase for a driven design, only Phase for
+    an eigenmode one). Each key is present only if it could be read.
     """
+    description: Dict[str, Any] = {}
     try:
-        available = list(hfss.existing_analysis_sweeps)
+        solutions = list(hfss.existing_analysis_sweeps)
+        if solutions:
+            description["solutions"] = solutions
     except Exception:
-        return ""
-    if not available or solution in available:
-        return ""
-    return f"solution {solution!r} was not found among this design's solutions; available: {available}"
+        pass
+    try:
+        intrinsics = list(hfss.design_solutions.intrinsics)
+        if intrinsics:
+            description["intrinsics"] = intrinsics
+    except Exception:
+        pass
+    return description
+
+
+def _failure_hints(entry: Dict[str, Any], design: Dict[str, Any]) -> List[str]:
+    """
+    Plain-language reasons for a failed export that the entry itself gives
+    away, drawn from `_design_description`: a `solution` the design doesn't
+    have, and intrinsics the design's solution type doesn't declare. Only
+    used after a failure, never to refuse an export up front, so a valid
+    name that PyAEDT's lists happen to omit can't be blocked.
+    """
+    hints = []
+    solutions = design.get("solutions")
+    if solutions and entry["solution"] not in solutions:
+        hints.append(f"solution {entry['solution']!r} was not found among this design's solutions; "
+                     f"available: {solutions}")
+    declared = design.get("intrinsics")
+    unknown = [key for key in (entry.get("intrinsics") or {}) if declared and key not in declared]
+    if unknown:
+        hints.append(f"intrinsic(s) {unknown} are not among the intrinsics PyAEDT lists for this design, "
+                     f"{declared}")
+    return hints
 
 
 def _with_units(values: List[float], units: str) -> List[str]:

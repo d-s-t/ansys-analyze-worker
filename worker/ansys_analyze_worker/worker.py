@@ -40,6 +40,31 @@ from . import field_exports
 logger = logging.getLogger("ansys_analyze_worker")
 
 
+def describe_installation() -> str:
+    """
+    Which build is running, for the first line of the log: the version, and
+    for a pip install from git also the commit (`direct_url.json` records
+    it). The version alone can't say -- several commits share one number --
+    and "was the worker restarted on the new code?" is the first question
+    when a fix doesn't seem to take effect. Never raises.
+    """
+    from . import __version__
+
+    text = f"ansys-analyze-worker {__version__}"
+    try:
+        from importlib import metadata
+
+        direct_url = json.loads(metadata.distribution("ansys-analyze-worker").read_text("direct_url.json") or "{}")
+        commit = (direct_url.get("vcs_info") or {}).get("commit_id")
+        if commit:
+            text += f" (git {commit[:7]})"
+        elif (direct_url.get("dir_info") or {}).get("editable"):
+            text += " (editable install)"
+    except Exception:
+        pass
+    return text
+
+
 class Worker:
     def __init__(
         self,
@@ -160,6 +185,7 @@ class Worker:
 
     # -- main loop ------------------------------------------------------------
     def run_forever(self) -> None:
+        logger.info("Starting %s", describe_installation())
         compat.apply_psutil_listen_fix()
         compat.check_psutil_listen_status()
         recovered = recover_orphaned_tasks(self.queue)

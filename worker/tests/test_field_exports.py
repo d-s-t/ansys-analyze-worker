@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -100,7 +101,8 @@ class FakeHfss:
     project_name = "proj"
     design_name = "HFSSDesign1"
 
-    def __init__(self, reporter, calls, edit_sources_result=True, messages=None, solutions=None):
+    def __init__(self, reporter, calls, edit_sources_result=True, messages=None, solutions=None,
+                 design_intrinsics=None):
         self.ofieldsreporter = reporter
         self._calls = calls
         self._edit_sources_result = edit_sources_result
@@ -108,6 +110,9 @@ class FakeHfss:
         self.closed_with = None
         # PyAEDT's Hfss.existing_analysis_sweeps: "<setup> : <sweep>" for every solution in the design.
         self.existing_analysis_sweeps = ["Setup_F : LastAdaptive", "Setup_F : Sweep"] if solutions is None else solutions
+        # PyAEDT's Hfss.design_solutions.intrinsics: ["Freq", "Phase"] driven, ["Phase"] eigenmode.
+        self.design_solutions = types.SimpleNamespace(
+            intrinsics=["Freq", "Phase"] if design_intrinsics is None else design_intrinsics)
 
     def edit_sources(self, assignment, **kwargs):
         self._calls.append(("edit_sources", assignment))
@@ -127,7 +132,8 @@ class FieldExportsTestCase(unittest.TestCase):
         self.logged = []
 
     def make_hfss(self, **reporter_kwargs):
-        hfss_kwargs = {k: reporter_kwargs.pop(k) for k in ("edit_sources_result", "messages", "solutions")
+        hfss_kwargs = {k: reporter_kwargs.pop(k)
+                       for k in ("edit_sources_result", "messages", "solutions", "design_intrinsics")
                        if k in reporter_kwargs}
         return FakeHfss(FakeFieldsReporter(self.calls, **reporter_kwargs), self.calls, **hfss_kwargs)
 
@@ -168,7 +174,7 @@ class RunTests(FieldExportsTestCase):
              "Cartesian", ["0mm", "0mm", "0mm"], False),
         ])
 
-    def test_eigenmode_intrinsics_go_through_unchanged(self):
+    def test_intrinsics_are_passed_to_aedt_exactly_as_given(self):
         entry = {**DRIVEN_ENTRY, "name": "mode1", "intrinsics": {"Mode": "1", "Phase": "0deg"}}
         del entry["sources"]
         result = self.run_exports(self.make_hfss(), entry)
@@ -333,6 +339,65 @@ class FailureTests(FieldExportsTestCase):
             result = self.run_exports(hfss, entry)
         self.assertIn("'Nope' is neither a field quantity nor a named calculator expression",
                       result["substrate_mid_E"]["error"])
+
+    def test_a_failure_records_exactly_what_was_sent_to_exportongrid(self):
+        hfss = self.make_hfss(fail_with="Failed to execute gRPC AEDT command: ExportOnGrid")
+        with self.assertLogs("ansys_analyze_worker", level="WARNING"):
+            result = self.run_exports(hfss, DRIVEN_ENTRY)
+        sent = self.export_calls()[0][2:]  # the fake records ("ExportOnGrid", file, *the other nine)
+        recorded = result["substrate_mid_E"]["export_on_grid_args"]
+        self.assertEqual(recorded[0], "fields/substrate_mid_E.fld")
+        self.assertEqual(recorded[1:], list(sent))
+        json.dumps(result)  # result.json must be able to hold it
+
+    def test_a_failure_records_what_the_design_declares(self):
+        hfss = self.make_hfss(fail_with="boom")
+        with self.assertLogs("ansys_analyze_worker", level="WARNING"):
+            result = self.run_exports(hfss, DRIVEN_ENTRY)
+        self.assertEqual(result["substrate_mid_E"]["design"], {
+            "solutions": ["Setup_F : LastAdaptive", "Setup_F : Sweep"], "intrinsics": ["Freq", "Phase"]})
+
+    def test_the_failure_is_logged_with_the_arguments_and_the_design(self):
+        hfss = self.make_hfss(fail_with="boom")
+        with self.assertLogs("ansys_analyze_worker", level="WARNING") as logs:
+            self.run_exports(hfss, DRIVEN_ENTRY)
+        self.assertTrue(any("ExportOnGrid arguments" in line and "Setup_F : Sweep" in line for line in logs.output))
+
+    def test_design_is_left_out_when_it_cannot_be_read(self):
+        hfss = self.make_hfss(fail_with="boom")
+        del hfss.existing_analysis_sweeps
+        del hfss.design_solutions
+        with self.assertLogs("ansys_analyze_worker", level="WARNING"):
+            result = self.run_exports(hfss, DRIVEN_ENTRY)
+        self.assertNotIn("design", result["substrate_mid_E"])
+        self.assertIn("export_on_grid_args", result["substrate_mid_E"])
+
+    def test_an_intrinsic_the_design_does_not_declare_is_named_in_the_error(self):
+        # The eigenmode case seen on real AEDT: PyAEDT lists only Phase, and Mode was sent.
+        entry = {**DRIVEN_ENTRY, "intrinsics": {"Mode": "1", "Phase": "0deg"}}
+        entry.pop("sources")
+        hfss = self.make_hfss(fail_with="Failed to execute gRPC AEDT command: ExportOnGrid",
+                              design_intrinsics=["Phase"])
+        with self.assertLogs("ansys_analyze_worker", level="WARNING"):
+            result = self.run_exports(hfss, entry)
+        error = result["substrate_mid_E"]["error"]
+        self.assertIn("intrinsic(s) ['Mode'] are not among the intrinsics PyAEDT lists for this design, ['Phase']",
+                      error)
+        self.assertEqual(result["substrate_mid_E"]["design"]["intrinsics"], ["Phase"])
+
+    def test_no_intrinsic_hint_when_they_are_all_declared(self):
+        with self.assertLogs("ansys_analyze_worker", level="WARNING"):
+            result = self.run_exports(self.make_hfss(fail_with="boom"), DRIVEN_ENTRY)
+        self.assertNotIn("intrinsic(s)", result["substrate_mid_E"]["error"])
+
+    def test_an_undeclared_intrinsic_is_still_tried_not_refused_up_front(self):
+        # How AEDT picks an eigenmode for a field export is not established, so the
+        # declared list is only ever used to explain a failure.
+        entry = {**DRIVEN_ENTRY, "intrinsics": {"Mode": "1", "Phase": "0deg"}}
+        entry.pop("sources")
+        result = self.run_exports(self.make_hfss(design_intrinsics=["Phase"]), entry)
+        self.assertTrue(result["substrate_mid_E"]["success"])
+        self.assertEqual(self.export_calls()[0][6], ["Mode:=", "1", "Phase:=", "0deg"])
 
     def test_the_output_folder_not_being_creatable_fails_the_export_not_the_task(self):
         blocker = os.path.join(self.output_dir, "fields")
