@@ -65,11 +65,14 @@ def _status_of(raw_state: int, status_map: dict) -> str:
 class ApplyPsutilListenFixTests(unittest.TestCase):
     def setUp(self):
         self.status_map = dict(PSUTIL_7_2_2_TCP_STATUSES)
-        fake_pswindows = types.ModuleType("psutil._pswindows")
-        fake_pswindows.TCP_STATUSES = self.status_map
+        self.fake_pswindows = types.ModuleType("psutil._pswindows")
+        self.fake_pswindows.TCP_STATUSES = self.status_map
         for patcher in (
             mock.patch.object(sys, "platform", "win32"),
-            mock.patch.dict(sys.modules, {"psutil._pswindows": fake_pswindows}),
+            # Patch the attribute, not sys.modules: `from psutil import _pswindows` looks at the
+            # package attribute first, and on Windows that is already the real module. create=True
+            # because off Windows the attribute does not exist at all.
+            mock.patch.object(psutil, "_pswindows", self.fake_pswindows, create=True),
             mock.patch.object(compat, "_fix_applied", False),
         ):
             patcher.start()
@@ -114,7 +117,7 @@ class ApplyPsutilListenFixTests(unittest.TestCase):
         self.assertNotIn(0, self.status_map)
 
     def test_unexpected_psutil_internals_return_false_instead_of_raising(self):
-        sys.modules["psutil._pswindows"] = types.ModuleType("psutil._pswindows")  # no TCP_STATUSES
+        del self.fake_pswindows.TCP_STATUSES
         with self.assertLogs(compat.logger, level="WARNING"):
             self.assertFalse(compat.apply_psutil_listen_fix())
 
