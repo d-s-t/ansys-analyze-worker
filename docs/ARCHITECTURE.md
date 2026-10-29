@@ -354,7 +354,7 @@ the files back, and does all plotting and analysis.
     "solution": "Setup_F : LastAdaptive",
     "intrinsics": {"Freq": "12.29GHz", "Phase": "0deg"},
     "sources": {"port_1:1": ["1W", "0deg"], "port_2:1": ["0W", "0deg"]},
-    "expression": ["E", "CmplxMag"],
+    "expression": ["Mag_E"],
     "grid": {"type": "Cartesian", "start": [-25, 1.19, -12.5], "stop": [25, 1.19, 12.5], "step": [0.25, 1, 0.25], "units": "mm"}
   }
 ]
@@ -366,7 +366,7 @@ the files back, and does all plotting and analysis.
 | `solution` | yes | Passed to AEDT as-is, e.g. `"Setup_F : LastAdaptive"`. |
 | `intrinsics` | no | Passed to AEDT as-is: `Freq`/`Phase` for a driven run, `Mode`/`Phase` for eigenmode (`{"Mode": "1", "Phase": "0deg"}`). The worker doesn't interpret them, so it stays solution-type agnostic (§6). |
 | `sources` | no | Driven only. Excitation name → `"1W"` or `["1W", "0deg"]`, applied with `edit_sources` before that entry is evaluated. Omitted means whatever the sources currently are — which, since entries run in order, is what the previous entry left. The worker closes the project **without saving** when any entry used `sources`, so the project the client gets back is still the one `run_setups` saved. |
-| `expression` | yes | A calculator recipe: a quantity name followed by calculator operations, pushed onto a cleared stack. `["E", "CmplxMag"]`, `["H", "CmplxMag"]`, or a single named expression such as `["Mag_E"]`. This keeps the worker free of any list of physical quantities. |
+| `expression` | yes | A calculator recipe: a quantity name followed by calculator operations, pushed onto a cleared stack. For the magnitude of a field use the named expressions `["Mag_E"]` / `["Mag_H"]`, which give one clean scalar column. The operations are applied exactly as given and the worker doesn't know what they return, so check: **`["E", "CmplxMag"]` is not \|E\|** — on a vector it exports three columns, some entries negative, whose norm was 1.5–3.4× `Mag_E` at the same points on the model it was tried on. This keeps the worker free of any list of physical quantities. |
 | `grid` | yes | Cartesian `start`, `stop` and `step` (three numbers each) and `units` (default `"mm"`), as `ExportOnGrid` takes them. A plane is a grid with `start == stop` on one axis, but that axis still needs a non-zero `step` — every `step` must be greater than zero. |
 
 Behaviour:
@@ -378,12 +378,26 @@ Behaviour:
 - A failed export is recorded in `result.json` (§5) with the error and any
   new AEDT error messages, and **does not fail the task** or skip the other
   exports — the same rule `run_setups` applies to a setup that fails to
-  solve. The task still files into `done/`.
+  solve. The task still files into `done/`. AEDT's own error text is just
+  `Failed to execute gRPC AEDT command: ExportOnGrid` (or `CalcOp`), so the
+  worker adds what it can: the calculator operation that failed, and — when
+  the `solution` isn't among the design's solutions — the list of ones that
+  are. That list is only added to a failure; a name missing from it is
+  still tried, never refused up front.
 - The setup must have solved fields. A driven setup's `LastAdaptive` keeps
   fields at its solution frequency; an interpolating sweep doesn't. That is
   the client's concern, since it creates the setup.
 - The `.fld` file is plain text: a header plus `x y z value` rows (more
-  columns for vectors). About 20 k points is under 1 MB.
+  columns for vectors). What was observed on AEDT with this call, so a
+  reader needn't guess:
+  - the header names millimetres, but the **data rows are in metres** (SI);
+  - rows are ordered **z fastest, then y, then x**;
+  - values at points with no field (inside metal, or outside the field
+    domain) are written as `Nan`. They are still rows, so `points` in
+    `result.json` counts them — a coarse volume grid over a package model
+    had 8914 NaN rows out of 10388;
+  - size: a 201 × 1 × 101 plane (20 301 points) is about 2.8 MB as a
+    three-column vector.
 - Not supported yet: scattered `points` (only a `grid`) and non-Cartesian
   grids. The validator rejects them with a clear message rather than
   ignoring them.
@@ -1153,7 +1167,7 @@ re-testing the whole pipeline against a small batch first.
 | Task reports `success: true` but the client finds no sweep data | The adaptive pass solved and the frequency sweep did not. `success` is in practice just `setup.is_solved`, which queries the *adaptive* solution (`<setup> : LastAdaptive`) and says nothing about the sweeps under it — so a driven setup whose sweep failed still reports `true` and still files into `done/`. That's deliberate (the worker reports what it ran; the client's post-processing is what surfaces missing solution data — §5/§7). Check the HFSS message manager on the worker machine for the sweep's actual error. |
 | A setup didn't actually solve | This does NOT land the task in `failed/` — check the `success` flag for that setup name in the worker's own `result.json` (§5) first, or just let post-processing tell you (next row): it fails clearly, per-combo, the moment it tries to read solution data off an unsolved setup. |
 | A client pipeline gets `Mesh size (...) is greater than the limit for simulation in Ansys Electronics Desktop Student` when it reads a field out of a solved project | Expected for a large mesh — the Student version can't load fields past its size limit (§12). Ask the worker for the values instead, with a `field_exports` entry on the task (§3), and read `fields/<name>.fld` back. |
-| A `field_exports` entry has `success: false` in `result.json` | That export failed but the task didn't — read its `error` and `aedt_messages` (§5). Usual causes: a `solution` name that doesn't exist, an `expression` AEDT rejects, or a setup whose fields weren't kept (an interpolating sweep keeps none; use the adaptive solution at the frequency you want — §3). |
+| A `field_exports` entry has `success: false` in `result.json` | That export failed but the task didn't — read its `error` and `aedt_messages` (§5). The `error` says which calculator operation failed, and for a `solution` that isn't in the design it lists the ones that are. Usual causes: a `solution` name that doesn't exist, an `expression` AEDT rejects, or a setup whose fields weren't kept (an interpolating sweep keeps none; use the adaptive solution at the frequency you want — §3). |
 | Solves crawl / AEDT shows a `pyaedt_config` HPC configuration using 1 core | PyAEDT's `Setup.analyze()` default, not an AEDT setting — see §10.2. Worker versions ≥ 0.1.5 pass the real core count instead; on an older one, or to change it, set `ANSYS_ANALYZE_CORES` (§10, §10.2) and **fully exit and relaunch** the worker -- tray → Reset alone won't pick up a newly-set/edited environment variable (§10.2). |
 | AEDT complains about cores or HPC licensing after upgrading the worker | The worker now asks for every logical processor on the machine, which may be more than the HPC license grants. Set `ANSYS_ANALYZE_CORES` to the allowed number (or `aedt` to leave AEDT's own configuration alone) and fully exit and relaunch the worker -- tray → Reset alone won't pick up the new value (§10.2). |
 | Every task fails after about 2 minutes with `Failed to start new AEDT gRPC session on port ...` even though AEDT and its licence are fine; the log has an ERROR "psutil reports a plain listening socket as 'NONE'" at startup | Windows 11 26H2 (build 26300) returns TCP state 0 for listening sockets, psutil reports that as `NONE`, and PyAEDT only recognises a running AEDT by a `LISTEN` socket. Worker versions ≥ 0.1.6 map state 0 to `LISTEN` themselves (`compat.py`) and log one INFO line saying so at startup; on an older one, upgrade. If the ERROR still appears on ≥ 0.1.6, psutil's internals changed — the worker could not apply the fix. Delete `compat.py`'s shim once psutil handles 26H2. Details: [issue #11](https://github.com/d-s-t/ansys-analyze-worker/issues/11). |

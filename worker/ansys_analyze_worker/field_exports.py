@@ -73,7 +73,11 @@ def run(hfss, task: Dict[str, Any], log) -> Dict[str, Any]:
             results[name] = _export_one(hfss, entry, task["output_dir"])
         except Exception as exc:
             logger.warning("Field export %s failed: %s", name, exc, exc_info=True)
-            failure: Dict[str, Any] = {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+            error = f"{type(exc).__name__}: {exc}"
+            hint = _unknown_solution_hint(hfss, entry["solution"])
+            if hint:
+                error += f" ({hint})"
+            failure: Dict[str, Any] = {"success": False, "error": error}
             new_messages = _aedt_error_messages(hfss)[len(messages_before):]
             if new_messages:
                 failure["aedt_messages"] = new_messages
@@ -109,9 +113,18 @@ def _export_one(hfss, entry: Dict[str, Any], output_dir: str) -> Dict[str, Any]:
         reporter.EnterQty(quantity)
     except Exception:
         # Not a basic quantity: a named expression from the calculator (e.g. Mag_E).
-        reporter.CopyNamedExprToStack(quantity)
+        try:
+            reporter.CopyNamedExprToStack(quantity)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{quantity!r} is neither a field quantity nor a named calculator expression: {exc}"
+            ) from exc
     for operation in operations:
-        reporter.CalcOp(operation)
+        try:
+            reporter.CalcOp(operation)
+        except Exception as exc:
+            # AEDT's own message is just "Failed to execute gRPC AEDT command: CalcOp".
+            raise RuntimeError(f"calculator operation {operation!r} failed: {exc}") from exc
 
     intrinsics: List[Any] = []
     for key, value in (entry.get("intrinsics") or {}).items():
@@ -139,6 +152,24 @@ def _export_one(hfss, entry: Dict[str, Any], output_dir: str) -> Dict[str, Any]:
     if points == 0:
         raise RuntimeError("the exported file has no data rows")
     return {"success": True, "file": f"{FIELDS_SUBDIR}/{name}.fld", "points": points}
+
+
+def _unknown_solution_hint(hfss, solution: str) -> str:
+    """
+    For a failed export: if `solution` isn't among the design's solutions,
+    say so and list them -- AEDT's own error for a wrong solution name is
+    just "Failed to execute gRPC AEDT command: ExportOnGrid". Only used
+    after a failure, never to refuse an export up front, so a valid name
+    that PyAEDT's list happens to omit can't be blocked. "" when the list
+    can't be read, is empty, or contains the solution.
+    """
+    try:
+        available = list(hfss.existing_analysis_sweeps)
+    except Exception:
+        return ""
+    if not available or solution in available:
+        return ""
+    return f"solution {solution!r} was not found among this design's solutions; available: {available}"
 
 
 def _with_units(values: List[float], units: str) -> List[str]:

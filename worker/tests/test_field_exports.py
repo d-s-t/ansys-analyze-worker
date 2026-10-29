@@ -45,13 +45,16 @@ DRIVEN_ENTRY = {
 class FakeFieldsReporter:
     """Records every call; ExportOnGrid writes a .fld-like file like AEDT does."""
 
-    def __init__(self, calls, rows=5, fail_with=None, write=True, header_only=False, bad_quantities=()):
+    def __init__(self, calls, rows=5, fail_with=None, write=True, header_only=False, bad_quantities=(),
+                 bad_ops=(), no_named_expressions=False):
         self.calls = calls
         self.rows = rows
         self.fail_with = fail_with
         self.write = write
         self.header_only = header_only
         self.bad_quantities = bad_quantities
+        self.bad_ops = bad_ops
+        self.no_named_expressions = no_named_expressions
 
     def CalcStack(self, action):
         self.calls.append(("CalcStack", action))
@@ -63,9 +66,13 @@ class FakeFieldsReporter:
 
     def CopyNamedExprToStack(self, name):
         self.calls.append(("CopyNamedExprToStack", name))
+        if self.no_named_expressions:
+            raise RuntimeError("Failed to execute gRPC AEDT command: CopyNamedExprToStack")
 
     def CalcOp(self, operation):
         self.calls.append(("CalcOp", operation))
+        if operation in self.bad_ops:
+            raise RuntimeError("Failed to execute gRPC AEDT command: CalcOp")
 
     def ExportOnGrid(self, filename, start, stop, step, solution, variation, options, grid_type, center, flag):
         self.calls.append(("ExportOnGrid", filename, start, stop, step, solution, variation, options, grid_type,
@@ -93,12 +100,14 @@ class FakeHfss:
     project_name = "proj"
     design_name = "HFSSDesign1"
 
-    def __init__(self, reporter, calls, edit_sources_result=True, messages=None):
+    def __init__(self, reporter, calls, edit_sources_result=True, messages=None, solutions=None):
         self.ofieldsreporter = reporter
         self._calls = calls
         self._edit_sources_result = edit_sources_result
         self.odesktop = FakeOdesktop(messages if messages is not None else [])
         self.closed_with = None
+        # PyAEDT's Hfss.existing_analysis_sweeps: "<setup> : <sweep>" for every solution in the design.
+        self.existing_analysis_sweeps = ["Setup_F : LastAdaptive", "Setup_F : Sweep"] if solutions is None else solutions
 
     def edit_sources(self, assignment, **kwargs):
         self._calls.append(("edit_sources", assignment))
@@ -118,7 +127,8 @@ class FieldExportsTestCase(unittest.TestCase):
         self.logged = []
 
     def make_hfss(self, **reporter_kwargs):
-        hfss_kwargs = {k: reporter_kwargs.pop(k) for k in ("edit_sources_result", "messages") if k in reporter_kwargs}
+        hfss_kwargs = {k: reporter_kwargs.pop(k) for k in ("edit_sources_result", "messages", "solutions")
+                       if k in reporter_kwargs}
         return FakeHfss(FakeFieldsReporter(self.calls, **reporter_kwargs), self.calls, **hfss_kwargs)
 
     def task(self, *entries):
@@ -273,6 +283,56 @@ class FailureTests(FieldExportsTestCase):
         self.assertFalse(result["substrate_mid_E"]["success"])
         self.assertIn("edit_sources failed", result["substrate_mid_E"]["error"])
         self.assertEqual(self.export_calls(), [])
+
+    def test_an_unknown_solution_error_lists_the_available_ones(self):
+        entry = {**DRIVEN_ENTRY, "solution": "NoSuchSetup : LastAdaptive"}
+        with self.assertLogs("ansys_analyze_worker", level="WARNING"):
+            result = self.run_exports(
+                self.make_hfss(fail_with="Failed to execute gRPC AEDT command: ExportOnGrid"), entry)
+        error = result["substrate_mid_E"]["error"]
+        self.assertIn("Failed to execute gRPC AEDT command: ExportOnGrid", error)  # AEDT's own text is kept
+        self.assertIn("'NoSuchSetup : LastAdaptive' was not found among this design's solutions", error)
+        self.assertIn("'Setup_F : LastAdaptive', 'Setup_F : Sweep'", error)
+
+    def test_no_solution_hint_when_the_solution_exists(self):
+        with self.assertLogs("ansys_analyze_worker", level="WARNING"):
+            result = self.run_exports(self.make_hfss(fail_with="some other reason"), DRIVEN_ENTRY)
+        self.assertNotIn("available", result["substrate_mid_E"]["error"])
+
+    def test_no_solution_hint_when_the_solutions_cannot_be_listed(self):
+        entry = {**DRIVEN_ENTRY, "solution": "NoSuchSetup : LastAdaptive"}
+        for broken in (None, []):
+            with self.subTest(solutions=broken):
+                hfss = self.make_hfss(fail_with="boom", solutions=[] if broken == [] else None)
+                if broken is None:
+                    del hfss.existing_analysis_sweeps  # an Hfss without the property
+                with self.assertLogs("ansys_analyze_worker", level="WARNING"):
+                    result = self.run_exports(hfss, entry)
+                self.assertEqual(result["substrate_mid_E"]["error"], "RuntimeError: boom")
+
+    def test_a_solution_missing_from_the_list_is_still_exported_not_refused_up_front(self):
+        # The hint is for failures only: a valid name PyAEDT's list omits must not be blocked.
+        entry = {**DRIVEN_ENTRY, "solution": "Setup_F : SomethingTheListOmits"}
+        result = self.run_exports(self.make_hfss(), entry)
+        self.assertTrue(result["substrate_mid_E"]["success"])
+        self.assertEqual(self.export_calls()[0][5], "Setup_F : SomethingTheListOmits")
+
+    def test_a_failing_calculator_operation_names_the_operation(self):
+        entry = {**DRIVEN_ENTRY, "expression": ["E", "NotACalcOp"]}
+        with self.assertLogs("ansys_analyze_worker", level="WARNING"):
+            result = self.run_exports(self.make_hfss(bad_ops=("NotACalcOp",)), entry)
+        error = result["substrate_mid_E"]["error"]
+        self.assertIn("calculator operation 'NotACalcOp' failed", error)
+        self.assertIn("Failed to execute gRPC AEDT command: CalcOp", error)
+        self.assertEqual(self.export_calls(), [])
+
+    def test_a_quantity_that_is_neither_basic_nor_a_named_expression_says_so(self):
+        entry = {**DRIVEN_ENTRY, "expression": ["Nope"]}
+        hfss = self.make_hfss(bad_quantities=("Nope",), no_named_expressions=True)
+        with self.assertLogs("ansys_analyze_worker", level="WARNING"):
+            result = self.run_exports(hfss, entry)
+        self.assertIn("'Nope' is neither a field quantity nor a named calculator expression",
+                      result["substrate_mid_E"]["error"])
 
     def test_the_output_folder_not_being_creatable_fails_the_export_not_the_task(self):
         blocker = os.path.join(self.output_dir, "fields")

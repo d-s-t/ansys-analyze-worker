@@ -97,7 +97,7 @@ def _validate_field_export(index: int, entry: Any, seen_names: set) -> None:
     if not isinstance(expression, list) or not expression or not all(isinstance(x, str) and x for x in expression):
         raise TaskValidationError(
             f"{where}: 'expression' must be a non-empty list of strings: a quantity followed by calculator "
-            "operations, e.g. ['E', 'CmplxMag']."
+            "operations, e.g. ['Mag_E']."
         )
 
     _validate_field_export_grid(where, entry["grid"])
