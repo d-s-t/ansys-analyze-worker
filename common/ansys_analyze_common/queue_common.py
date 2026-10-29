@@ -16,7 +16,9 @@ from __future__ import annotations
 import datetime as _dt
 import glob
 import json
+import math
 import os
+import re
 import tempfile
 from typing import Any, Dict, List, Optional
 
@@ -30,9 +32,95 @@ REQUIRED_TOP_LEVEL_FIELDS = (
     "output_dir",
 )
 
+# `field_exports` entries (docs/ARCHITECTURE.md section 3). The name becomes a
+# file name under <output_dir>/fields/, so it is kept to a safe, portable set.
+FIELD_EXPORT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+FIELD_EXPORT_REQUIRED_KEYS = ("name", "solution", "expression", "grid")
+FIELD_EXPORT_OPTIONAL_KEYS = ("intrinsics", "sources")
+FIELD_EXPORT_GRID_TYPES = ("Cartesian",)
+FIELD_EXPORT_DEFAULT_UNITS = "mm"
+
 
 class TaskValidationError(ValueError):
     """Raised when a task JSON file is missing required fields or malformed."""
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _validate_field_export(index: int, entry: Any, seen_names: set) -> None:
+    where = f"'field_exports'[{index}]"
+    if not isinstance(entry, dict):
+        raise TaskValidationError(f"{where} must be an object.")
+
+    name = entry.get("name")
+    if isinstance(name, str):
+        where = f"{where} ({name!r})"
+
+    allowed = FIELD_EXPORT_REQUIRED_KEYS + FIELD_EXPORT_OPTIONAL_KEYS
+    unknown = sorted(set(entry) - set(allowed))
+    if unknown:
+        hint = " ('points' is not supported yet; use 'grid')" if "points" in unknown else ""
+        raise TaskValidationError(f"{where} has unknown key(s) {unknown}; allowed: {list(allowed)}{hint}.")
+    missing = [k for k in FIELD_EXPORT_REQUIRED_KEYS if k not in entry]
+    if missing:
+        raise TaskValidationError(f"{where} is missing required key(s): {missing}.")
+
+    if not isinstance(name, str) or not FIELD_EXPORT_NAME_PATTERN.match(name):
+        raise TaskValidationError(f"{where}: 'name' must be a non-empty string of letters, digits, '_' and '-'.")
+    if name in seen_names:
+        raise TaskValidationError(f"{where}: duplicate 'name'; each export writes fields/<name>.fld.")
+    seen_names.add(name)
+
+    if not isinstance(entry["solution"], str) or not entry["solution"].strip():
+        raise TaskValidationError(f"{where}: 'solution' must be a non-empty string, e.g. 'Setup1 : LastAdaptive'.")
+
+    intrinsics = entry.get("intrinsics", {})
+    if not isinstance(intrinsics, dict) or not all(
+        isinstance(k, str) and (isinstance(v, str) or _is_number(v)) for k, v in intrinsics.items()
+    ):
+        raise TaskValidationError(f"{where}: 'intrinsics' must be an object of names to strings, e.g. {{'Freq': '12.29GHz'}}.")
+
+    sources = entry.get("sources", {})
+    if not isinstance(sources, dict) or not all(
+        isinstance(k, str)
+        and (isinstance(v, str) or (isinstance(v, list) and len(v) == 2 and all(isinstance(x, str) for x in v)))
+        for k, v in sources.items()
+    ):
+        raise TaskValidationError(
+            f"{where}: 'sources' must be an object of excitation names to a magnitude string or a "
+            "[magnitude, phase] pair of strings, e.g. {'port_1:1': ['1W', '0deg']}."
+        )
+
+    expression = entry["expression"]
+    if not isinstance(expression, list) or not expression or not all(isinstance(x, str) and x for x in expression):
+        raise TaskValidationError(
+            f"{where}: 'expression' must be a non-empty list of strings: a quantity followed by calculator "
+            "operations, e.g. ['E', 'CmplxMag']."
+        )
+
+    _validate_field_export_grid(where, entry["grid"])
+
+
+def _validate_field_export_grid(where: str, grid: Any) -> None:
+    if not isinstance(grid, dict):
+        raise TaskValidationError(f"{where}: 'grid' must be an object.")
+    unknown = sorted(set(grid) - {"type", "start", "stop", "step", "units"})
+    if unknown:
+        raise TaskValidationError(f"{where}: 'grid' has unknown key(s) {unknown}.")
+    if grid.get("type", FIELD_EXPORT_GRID_TYPES[0]) not in FIELD_EXPORT_GRID_TYPES:
+        raise TaskValidationError(f"{where}: 'grid.type' must be one of {list(FIELD_EXPORT_GRID_TYPES)}.")
+    for key in ("start", "stop", "step"):
+        value = grid.get(key)
+        if not isinstance(value, list) or len(value) != 3 or not all(_is_number(x) for x in value):
+            raise TaskValidationError(f"{where}: 'grid.{key}' must be a list of three numbers.")
+    if any(step <= 0 for step in grid["step"]):
+        # A plane is start == stop on one axis, but that axis still needs a non-zero step.
+        raise TaskValidationError(f"{where}: every 'grid.step' value must be greater than zero.")
+    units = grid.get("units", FIELD_EXPORT_DEFAULT_UNITS)
+    if not isinstance(units, str) or not re.match(r"^[A-Za-z]+$", units):
+        raise TaskValidationError(f"{where}: 'grid.units' must be a length unit such as 'mm'.")
 
 
 def validate_task(task: Dict[str, Any]) -> None:
@@ -48,6 +136,13 @@ def validate_task(task: Dict[str, Any]) -> None:
 
     if "post_processing" in task and not isinstance(task["post_processing"], list):
         raise TaskValidationError("'post_processing' must be a list if present.")
+
+    if "field_exports" in task:
+        if not isinstance(task["field_exports"], list):
+            raise TaskValidationError("'field_exports' must be a list if present.")
+        seen_names: set = set()
+        for index, entry in enumerate(task["field_exports"]):
+            _validate_field_export(index, entry, seen_names)
 
     for dict_field in ("parameters", "objects", "metadata"):
         if dict_field in task and not isinstance(task[dict_field], dict):
@@ -70,6 +165,7 @@ def build_task(
     parameters: Optional[Dict[str, Any]] = None,
     objects: Optional[Dict[str, str]] = None,
     post_processing: Optional[List[Dict[str, Any]]] = None,
+    field_exports: Optional[List[Dict[str, Any]]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     task_id: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -95,6 +191,14 @@ def build_task(
     is worth avoiding: it's an extra point of failure, and at least one
     PyAEDT version has a bug in its own fallback path when that call
     fails, masking the real error behind an unrelated AttributeError.
+
+    `field_exports` is the one post-solve step the worker does for the
+    client: the Student version cannot load a field solution whose mesh is
+    over its size limit, so the worker (full license) evaluates the
+    requested field expressions at the requested points and writes the raw
+    numbers to <output_dir>/fields/<name>.fld. See docs/ARCHITECTURE.md
+    section 3 for the entry format. It is omitted from the task entirely
+    when empty, so tasks built without it are unchanged.
     """
     task = {
         "schema_version": SCHEMA_VERSION,
@@ -110,6 +214,8 @@ def build_task(
         "post_processing": post_processing or [],
         "metadata": metadata or {},
     }
+    if field_exports:
+        task["field_exports"] = field_exports
     validate_task(task)
     return task
 

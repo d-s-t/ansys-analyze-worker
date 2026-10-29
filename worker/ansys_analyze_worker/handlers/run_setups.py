@@ -20,7 +20,10 @@ new setups searching for a target frequency, and does not extract mode
 data, S-parameters, or run field plots -- the client pipeline reopens the
 analyzed project afterward (student version) and pulls everything it
 needs straight out of the solved project. See ARCHITECTURE.md sections 6,
-7, 8 and 12 for why that split exists.
+7, 8 and 12 for why that split exists. (The one thing the client cannot
+read back itself -- field values of a mesh over the Student size limit --
+is exported by `field_exports.py` after this handler returns, when the
+task asks for it; it is not this handler's business.)
 
 A setup that fails to solve does NOT abort the task or block the other
 setups -- it's just recorded as `{"success": False}` for that setup name,

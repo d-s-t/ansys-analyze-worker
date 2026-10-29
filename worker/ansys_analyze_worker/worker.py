@@ -34,6 +34,7 @@ from typing import Optional
 from ansys_analyze_common.queue_common import QueuePaths, recover_orphaned_tasks, resolve_path, validate_task
 
 from .handlers import get_handler
+from . import field_exports
 
 logger = logging.getLogger("ansys_analyze_worker")
 
@@ -216,10 +217,16 @@ class Worker:
             hfss = self._open_project(task)
             try:
                 result = handler(hfss, task, log=logger.info)
+                # The one post-solve step the Student version can't do for
+                # large meshes -- see field_exports.py. {} (and so no change
+                # to result.json) when the task asks for none.
+                exported_fields = field_exports.run(hfss, task, log=logger.info)
             finally:
-                self._close_project(hfss)
+                # Exports that edit sources changed the project in memory;
+                # the handler already saved it, so don't save that over it.
+                self._close_project(hfss, save=not field_exports.edits_sources(task))
 
-            self._finish_success(in_progress_path, task, result)
+            self._finish_success(in_progress_path, task, result, exported_fields)
 
         except Exception as exc:
             self._finish_failure(in_progress_path, task, exc)
@@ -241,14 +248,14 @@ class Worker:
             kwargs["solution_type"] = task["solution_type"]
         return Hfss(**kwargs)
 
-    def _close_project(self, hfss) -> None:
+    def _close_project(self, hfss, save: bool = True) -> None:
         try:
             if hfss and getattr(hfss, "project_name", None):
-                hfss.close_project(name=hfss.project_name)
+                hfss.close_project(name=hfss.project_name, save=save)
         except Exception:
             logger.warning("Failed to close project cleanly.", exc_info=True)
 
-    def _finish_success(self, in_progress_path: str, task: dict, result: dict) -> None:
+    def _finish_success(self, in_progress_path: str, task: dict, result: dict, exported_fields: Optional[dict] = None) -> None:
         out_dir = task["output_dir"]
         os.makedirs(out_dir, exist_ok=True)
         summary = {
@@ -258,6 +265,9 @@ class Worker:
             "metadata": task.get("metadata", {}),
             "result": result,
         }
+        if exported_fields:
+            # Beside "result", not inside it: that block is keyed by setup name.
+            summary["field_exports"] = exported_fields
         with open(os.path.join(out_dir, "result.json"), "w") as f:
             json.dump(summary, f, indent=2, default=str)
 
