@@ -428,7 +428,12 @@ the task file in `failed/<task_id>.task.json.error.log` regardless.
 `ansys_analyze_worker/worker.py` contains **zero** knowledge of eigenmodes,
 pedestals, chips, or anything experiment-specific. All it does is:
 
-1. Watch `pending/` for `*.task.json` files.
+1. Watch `pending/` for `*.task.json` files, taking the **oldest first** —
+   by when the file arrived (its modification time), not by file name. The
+   start of a `task_id` is whatever label the client chose, so name order
+   would run every `driven_...` task before any older `launch_...` one. A
+   task recovered at startup or retried from `failed/` keeps its original
+   place in line, because moving a file keeps its modification time.
 2. Move a task to `in_progress/`, load and validate the JSON.
 3. Resolve `project_file`/`output_dir` against the queue root
    (`queue_common.resolve_path`) and overwrite them in the in-memory task

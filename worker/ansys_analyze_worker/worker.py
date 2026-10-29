@@ -186,9 +186,28 @@ class Worker:
                 logger.exception("Unhandled error in worker loop iteration")
             time.sleep(self.poll_interval_seconds)
 
+    def _pending_task_files(self) -> list:
+        """
+        The task files in pending/, oldest first.
+
+        By when each file arrived (its modification time), not by file name:
+        a task_id starts with whatever label the client chose ("driven_...",
+        "launch_..."), so sorting by name ran every "driven_" task before any
+        older "launch_" one. `write_task_atomically` renames its temp file
+        into place, and moving a file keeps its mtime, so a task recovered
+        from in_progress/ or retried from failed/ keeps its original place in
+        line. Files with the same mtime fall back to name order.
+        """
+        arrivals = []
+        for path in glob.glob(os.path.join(self.queue.pending, "*.task.json")):
+            try:
+                arrivals.append((os.path.getmtime(path), path))
+            except OSError:
+                continue  # taken by another worker / manual intervention since the listing
+        return [path for _, path in sorted(arrivals)]
+
     def _process_pending_tasks(self) -> None:
-        task_files = sorted(glob.glob(os.path.join(self.queue.pending, "*.task.json")))
-        for path in task_files:
+        for path in self._pending_task_files():
             if self.is_paused or self._stop_event.is_set():
                 break
             self._process_one(path)
