@@ -34,6 +34,7 @@ from typing import Optional
 from ansys_analyze_common.queue_common import QueuePaths, recover_orphaned_tasks, resolve_path, validate_task
 
 from . import compat
+from . import stale_locks
 from .handlers import get_handler
 
 logger = logging.getLogger("ansys_analyze_worker")
@@ -167,6 +168,9 @@ class Worker:
                 "Recovered %d orphaned in-progress task(s) back to pending/ (from a previous "
                 "crash or restart): %s", len(recovered), recovered
             )
+            # A dead AEDT leaves the project locked, which would fail these
+            # tasks the moment they're opened -- see stale_locks.py.
+            stale_locks.clear_stale_locks_for_tasks(self.queue, recovered)
 
         logger.info("Worker started. Watching %s", self.queue.pending)
         while not self._stop_event.is_set():
