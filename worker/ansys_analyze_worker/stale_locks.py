@@ -146,7 +146,8 @@ def clear_stale_locks_for_tasks(queue: QueuePaths, task_ids: List[str]) -> List[
         task_path = os.path.join(queue.pending, f"{task_id}.task.json")
         try:
             with open(task_path, "r") as f:
-                project_file = resolve_path(queue, json.load(f)["project_file"])
+                # normpath: on Windows a queue-relative "projects/t1/x.aedt" joins to mixed separators.
+                project_file = os.path.normpath(resolve_path(queue, json.load(f)["project_file"]))
         except Exception:
             logger.warning("Could not read the project of recovered task %s to check it for a stale lock.", task_id,
                            exc_info=True)

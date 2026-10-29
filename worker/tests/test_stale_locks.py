@@ -224,6 +224,15 @@ class ClearForTasksTests(ProjectTestCase):
         self.assertIn(self.lock, self.clear(["t1"]))
         self.assertGone(self.lock)
 
+    def test_the_paths_come_back_normalized(self):
+        # On Windows resolve_path() of "projects/t1/pkg.aedt" gives "<root>\\projects/t1/pkg.aedt", mixed
+        # separators, which made the removed paths (and the log) differ from the clean ones as strings.
+        # A redundant "./" and "../" produces the same kind of difference on any platform.
+        self.write_lock(DEAD_PID)
+        self.queue_task("t1", "projects/./t1/../t1/pkg.aedt")
+        removed = self.clear(["t1"])
+        self.assertEqual(sorted(removed), sorted([self.lock] + self.semaphores))
+
     def test_an_absolute_project_file_is_used_as_is(self):
         self.write_lock(DEAD_PID)
         self.queue_task("t1", self.project_file)
