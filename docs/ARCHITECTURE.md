@@ -419,6 +419,23 @@ Behaviour:
 `validate_task` checks every entry's shape, so a mistake is an error on the
 client before queuing, not a failed export on the worker.
 
+**Exporting without solving: `task_type: "export_fields"`.** `run_setups`
+always calls `analyze()`, and for an Eigenmode project that re-solves from
+scratch even when a solution is already saved (17 to 54 minutes in testing,
+where a solved driven setup is skipped in seconds). To take field values out
+of a project that is already solved, queue the same `field_exports` with
+`task_type: "export_fields"`: the worker opens the project, never analyzes,
+runs the exports, and closes it **without saving**, so the project the
+client has is not rewritten. A task with no `field_exports` fails with a
+clear message, since there would be nothing to do. In `result.json` the
+`result` block is `{"analyzed": false, "setups": {"Setup_1": {"solved": true}}}`,
+one entry per setup the exports name. `solved` is PyAEDT's `Setup.is_solved`
+(`null` when it couldn't be asked). A `false` is logged and recorded but does
+**not** stop the exports: that probe has been seen to say `false` for an
+eigenmode setup that AEDT's own log reported as solved, so refusing on it
+could block a valid export. If the exports then fail, their failure records
+(above) say why.
+
 ---
 
 ## 4. `common/ansys_analyze_common/queue_common.py` — the shared contract
@@ -558,6 +575,13 @@ kind they are. DrivenModal with a frequency sweep goes through it
 unchanged (`setup.analyze()` solves the adaptive passes *and* the sweeps
 under that setup), and so does DrivenTerminal. The client just sets
 `solution_type` on the task. No new handler, no new `task_type`.
+
+Today's handlers: `run_setups` (with its legacy alias `eigenmode_analyze`),
+and `export_fields`, which opens the project and runs only the task's
+`field_exports` without solving (§3). The second is a different *workflow*
+on the same kind of project, not a different solution type, which is why it
+is a `task_type` and not a flag on the first. A handler can mark itself
+`run.read_only = True`; `worker.py` then closes the project without saving.
 
 **A new handler is for a genuinely different *workflow*** — one that has
 to create state of its own, chain setups together, or drive a non-HFSS
@@ -1181,6 +1205,7 @@ re-testing the whole pipeline against a small batch first.
 | A setup didn't actually solve | This does NOT land the task in `failed/` — check the `success` flag for that setup name in the worker's own `result.json` (§5) first, or just let post-processing tell you (next row): it fails clearly, per-combo, the moment it tries to read solution data off an unsolved setup. |
 | A client pipeline gets `Mesh size (...) is greater than the limit for simulation in Ansys Electronics Desktop Student` when it reads a field out of a solved project | Expected for a large mesh — the Student version can't load fields past its size limit (§12). Ask the worker for the values instead, with a `field_exports` entry on the task (§3), and read `fields/<name>.fld` back. |
 | A `field_exports` entry has `success: false` in `result.json` | That export failed but the task didn't — read its `error` and `aedt_messages` (§5). The `error` says which calculator operation failed, for a `solution` that isn't in the design it lists the ones that are, and it names any `intrinsics` the design doesn't declare. The entry also carries `export_on_grid_args` (exactly what was sent to AEDT) and `design` (its solutions and intrinsics) to compare against. Usual causes: a `solution` name that doesn't exist, an `expression` AEDT rejects, or a setup whose fields weren't kept (an interpolating sweep keeps none; use the adaptive solution at the frequency you want — §3). **Every export fails on an Eigenmode design:** see the eigenmode note in §3 — `Mode` is not a verified intrinsic. |
+| A `field_exports` task on an Eigenmode project takes tens of minutes before the first export | `run_setups` always calls `analyze()`, and an Eigenmode project is re-solved from scratch even when its solution is saved. If the project is already solved, queue the same `field_exports` as `task_type: "export_fields"`, which never solves (§3). |
 | A fix or feature doesn't seem to take effect on the worker PC | Check the first line of the worker log: `Starting ansys-analyze-worker <version> (git <commit>)` is the build that is actually running (`(editable install)` for a development checkout). Several commits share one version number, so compare the commit. A running worker keeps the old code in memory after `pip install`; tray → Reset (or exiting and relaunching) loads the new code from disk (§10.1). |
 | Solves crawl / AEDT shows a `pyaedt_config` HPC configuration using 1 core | PyAEDT's `Setup.analyze()` default, not an AEDT setting — see §10.2. Worker versions ≥ 0.1.5 pass the real core count instead; on an older one, or to change it, set `ANSYS_ANALYZE_CORES` (§10, §10.2) and **fully exit and relaunch** the worker -- tray → Reset alone won't pick up a newly-set/edited environment variable (§10.2). |
 | AEDT complains about cores or HPC licensing after upgrading the worker | The worker now asks for every logical processor on the machine, which may be more than the HPC license grants. Set `ANSYS_ANALYZE_CORES` to the allowed number (or `aedt` to leave AEDT's own configuration alone) and fully exit and relaunch the worker -- tray → Reset alone won't pick up the new value (§10.2). |

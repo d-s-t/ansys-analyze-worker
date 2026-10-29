@@ -253,9 +253,11 @@ class Worker:
                 # to result.json) when the task asks for none.
                 exported_fields = field_exports.run(hfss, task, log=logger.info)
             finally:
-                # Exports that edit sources changed the project in memory;
-                # the handler already saved it, so don't save that over it.
-                self._close_project(hfss, save=not field_exports.edits_sources(task))
+                # Don't save over what the handler saved when exports edited
+                # sources (they changed the project in memory), or when the
+                # handler is read-only and saved nothing to begin with.
+                keep_saved = getattr(handler, "read_only", False) is True or field_exports.edits_sources(task)
+                self._close_project(hfss, save=not keep_saved)
 
             self._finish_success(in_progress_path, task, result, exported_fields)
 

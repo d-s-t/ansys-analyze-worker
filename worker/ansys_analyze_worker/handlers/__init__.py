@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict
 
-from . import run_setups
+from . import export_fields, run_setups
 
 TaskHandler = Callable[..., Dict[str, Any]]
 
@@ -34,6 +34,10 @@ HANDLERS: Dict[str, TaskHandler] = {
     # the behaviour. Do not delete it without checking the queue is drained
     # and every client has been updated.
     "eigenmode_analyze": run_setups.run,
+    # Open the project and export the task's field_exports from what is
+    # already solved, without calling analyze(). Different workflow from
+    # run_setups, so its own task_type.
+    "export_fields": export_fields.run,
 }
 
 
