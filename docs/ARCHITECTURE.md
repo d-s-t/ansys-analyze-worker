@@ -371,6 +371,9 @@ the files back, and does all plotting and analysis.
 
 Behaviour:
 
+- Needs worker ≥ 0.1.7 and `ansys-analyze-common` ≥ 0.1.4. An older worker
+  doesn't reject the field, it just ignores it, so the task succeeds and no
+  `fields/` folder or `field_exports` block appears in `result.json`.
 - Runs after **all** setups have been analysed, against the saved project.
 - A failed export is recorded in `result.json` (§5) with the error and any
   new AEDT error messages, and **does not fail the task** or skip the other
