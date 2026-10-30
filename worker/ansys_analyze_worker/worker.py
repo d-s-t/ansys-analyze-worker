@@ -41,6 +41,19 @@ from . import field_exports
 logger = logging.getLogger("ansys_analyze_worker")
 
 
+def _is_read_only(handler, task: dict) -> bool:
+    """
+    Whether this task leaves the project unchanged, so it should be closed
+    without saving. A handler opts in with a `read_only(task) -> bool`
+    attribute; anything else (including a Mock) is not read-only.
+    """
+    check = getattr(handler, "read_only", None)
+    try:
+        return callable(check) and check(task) is True
+    except Exception:
+        return False
+
+
 def describe_installation() -> str:
     """
     Which build is running, for the first line of the log: the version, and
@@ -280,7 +293,7 @@ class Worker:
                 # Don't save over what the handler saved when exports edited
                 # sources (they changed the project in memory), or when the
                 # handler is read-only and saved nothing to begin with.
-                keep_saved = getattr(handler, "read_only", False) is True or field_exports.edits_sources(task)
+                keep_saved = _is_read_only(handler, task) or field_exports.edits_sources(task)
                 self._close_project(hfss, save=not keep_saved)
 
             self._finish_success(in_progress_path, task, result, exported_fields)

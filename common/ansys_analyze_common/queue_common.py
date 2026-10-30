@@ -148,6 +148,11 @@ def validate_task(task: Dict[str, Any]) -> None:
         if dict_field in task and not isinstance(task[dict_field], dict):
             raise TaskValidationError(f"'{dict_field}' must be an object if present.")
 
+    # run_setups: `parameters.analyze: false` skips the solve. A string such as "false" is truthy, and
+    # would quietly re-solve for hours, so insist on a real boolean before anything is queued.
+    if "analyze" in (task.get("parameters") or {}) and not isinstance(task["parameters"]["analyze"], bool):
+        raise TaskValidationError("'parameters.analyze' must be true or false.")
+
 
 def new_task_id(prefix: str) -> str:
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
