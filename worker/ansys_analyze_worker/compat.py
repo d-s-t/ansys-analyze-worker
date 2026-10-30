@@ -20,6 +20,19 @@ Two pieces here: `apply_psutil_listen_fix()` maps state 0 to `LISTEN`, and
 `check_psutil_listen_status()` is a startup self-check that turns a
 recurrence of this class of problem into one log line instead of a day of
 diagnosis.
+
+**PyAEDT's `Desktop.__del__` after a failed `Desktop(...)`.** When the
+constructor raises (AEDT not found, the gRPC session never came up, ...) the
+half-built object is still garbage collected, and PyAEDT 1.0.0's `__del__`
+then tries to release a session that was never attached: it reads
+`self.project_list`, i.e. `self.odesktop.GetProjectList()`, while `odesktop`
+is `None`. The result is a second, long traceback -- a "PyAEDT ERROR" block
+plus "Exception ignored in: Desktop.__del__ ... 'NoneType' object has no
+attribute 'GetProjectList'" -- right after the real error, which makes the
+log look as if two things went wrong. `silence_failed_desktop_cleanup()`
+makes `__del__` do nothing for an object that never got an `odesktop`; every
+other Desktop is released exactly as before. The real failure is untouched
+and still reported.
 """
 from __future__ import annotations
 
@@ -110,6 +123,43 @@ def check_psutil_listen_status() -> Optional[str]:
             ISSUE_URL,
         )
     return status
+
+
+def silence_failed_desktop_cleanup() -> bool:
+    """
+    Make PyAEDT's `Desktop.__del__` skip a Desktop whose construction failed
+    (no `odesktop` was ever attached), so a failed `Desktop(...)` logs its
+    real error once instead of followed by a cleanup traceback.
+
+    Idempotent. Returns True if the guard is in place after the call, False
+    if it isn't (PyAEDT isn't importable, or `Desktop` has no `__del__`).
+    Never raises.
+
+    Remove when PyAEDT guards `Desktop.__del__` itself.
+    """
+    try:
+        from ansys.aedt.core.desktop import Desktop
+
+        original = Desktop.__dict__.get("__del__")
+        if original is None:
+            return False
+        if getattr(original, "_skips_failed_desktop", False):
+            return True
+
+        def guarded_del(self):
+            try:
+                attached = self.odesktop is not None
+            except Exception:
+                attached = False
+            if attached:
+                original(self)
+
+        guarded_del._skips_failed_desktop = True
+        Desktop.__del__ = guarded_del
+    except Exception:
+        logger.warning("Could not guard PyAEDT's Desktop.__del__.", exc_info=True)
+        return False
+    return True
 
 
 def _windows_build() -> str:
