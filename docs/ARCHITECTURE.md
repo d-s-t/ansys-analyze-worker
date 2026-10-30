@@ -375,7 +375,9 @@ Key functions:
   cleanup primitives behind a client pipeline's cleanup flow (§2.3).
 - `recover_orphaned_tasks(queue)` — moves anything stuck in
   `in_progress/` back to `pending/`; called automatically at worker
-  startup, including after the tray's "Reset" (§10).
+  startup, including after the tray's "Reset" (§10). Right after it, the
+  worker clears the stale AEDT project lock those tasks may have left
+  behind (`stale_locks.py`, §13), so a recovered task can be opened again.
 
 ---
 
@@ -426,7 +428,12 @@ the task file in `failed/<task_id>.task.json.error.log` regardless.
 `ansys_analyze_worker/worker.py` contains **zero** knowledge of eigenmodes,
 pedestals, chips, or anything experiment-specific. All it does is:
 
-1. Watch `pending/` for `*.task.json` files.
+1. Watch `pending/` for `*.task.json` files, taking the **oldest first** —
+   by when the file arrived (its modification time), not by file name. The
+   start of a `task_id` is whatever label the client chose, so name order
+   would run every `driven_...` task before any older `launch_...` one. A
+   task recovered at startup or retried from `failed/` keeps its original
+   place in line, because moving a file keeps its modification time.
 2. Move a task to `in_progress/`, load and validate the JSON.
 3. Resolve `project_file`/`output_dir` against the queue root
    (`queue_common.resolve_path`) and overwrite them in the in-memory task
@@ -691,7 +698,8 @@ this repo's second importable package:
 | `worker.py` | The generic scan/dispatch/file-away loop described in §6, plus the pause/release/stop-event handling that both `run_service.py` (threading.Event, no-tray mode) and `supervisor.py` (multiprocessing.Event, tray mode) drive it with. |
 | `tray_app.py` | The taskbar icon (via `pystray`) — release/resume, stop current run, open queue folder, open log, reset, exit. |
 | `hpc.py` | Resolves the `cores`/`tasks`/`gpus` the solve runs with (§10.2) — the reason the worker never calls `setup.analyze()` bare. |
-| `compat.py` | Small, guarded workarounds for third-party bugs, each meant to be deleted once upstream catches up. Today: the psutil listening-socket fix for Windows 26H2 and its startup self-check (§13). |
+| `compat.py` | Small, guarded workarounds for third-party bugs, each meant to be deleted once upstream catches up. Today: the psutil listening-socket fix for Windows 26H2 and its startup self-check, and a guard that stops PyAEDT's `Desktop.__del__` adding a cleanup traceback after a failed connection (both §13). |
+| `stale_locks.py` | At startup, after `recover_orphaned_tasks`, removes the `<project>.aedt.lock` and `.asol*.semaphore` files a dead AEDT left in each *recovered* task's project — only when the lock's `DesktopProcessID` is no longer a running AEDT. Never raises; leaves any lock it can't prove stale (§13). |
 | `handlers/` | One module per `task_type` (§6). |
 
 ### Import mechanics (why this matters if you add files)
@@ -1042,6 +1050,8 @@ re-testing the whole pipeline against a small batch first.
 | Solves crawl / AEDT shows a `pyaedt_config` HPC configuration using 1 core | PyAEDT's `Setup.analyze()` default, not an AEDT setting — see §10.2. Worker versions ≥ 0.1.5 pass the real core count instead; on an older one, or to change it, set `ANSYS_ANALYZE_CORES` (§10, §10.2) and **fully exit and relaunch** the worker -- tray → Reset alone won't pick up a newly-set/edited environment variable (§10.2). |
 | AEDT complains about cores or HPC licensing after upgrading the worker | The worker now asks for every logical processor on the machine, which may be more than the HPC license grants. Set `ANSYS_ANALYZE_CORES` to the allowed number (or `aedt` to leave AEDT's own configuration alone) and fully exit and relaunch the worker -- tray → Reset alone won't pick up the new value (§10.2). |
 | Every task fails after about 2 minutes with `Failed to start new AEDT gRPC session on port ...` even though AEDT and its licence are fine; the log has an ERROR "psutil reports a plain listening socket as 'NONE'" at startup | Windows 11 26H2 (build 26300) returns TCP state 0 for listening sockets, psutil reports that as `NONE`, and PyAEDT only recognises a running AEDT by a `LISTEN` socket. Worker versions ≥ 0.1.6 map state 0 to `LISTEN` themselves (`compat.py`) and log one INFO line saying so at startup; on an older one, upgrade. If the ERROR still appears on ≥ 0.1.6, psutil's internals changed — the worker could not apply the fix. Delete `compat.py`'s shim once psutil handles 26H2. Details: [issue #11](https://github.com/d-s-t/ansys-analyze-worker/issues/11). |
+| A task fails immediately with `RuntimeError: Project is locked. Close or remove the lock before proceeding.` | PyAEDT refuses to open a project whose `<project>.aedt.lock` exists. After AEDT or the worker dies mid-task the lock (and the `.asol*.semaphore` files in `<project>.aedtresults/`) stays behind. For a task the worker *recovered* at startup it removes them itself, if the lock's `DesktopProcessID` is no longer a running AEDT (`stale_locks.py`; the log says `Removed N stale lock file(s)...`). It deliberately leaves alone a lock whose AEDT is still running, one it can't read, and any project that wasn't recovered — e.g. a failed task you retried, or one open in an AEDT on another machine. In those cases close the project in AEDT, or delete the `.lock` yourself once you are sure no AEDT has it open. |
+| After a failed AEDT connection the log has a second, long traceback ending `'NoneType' object has no attribute 'GetProjectList'` (a "PyAEDT ERROR" block plus "Exception ignored in: Desktop.__del__") | PyAEDT cleanup noise, not a second failure: when `Desktop(...)` raises, the half-built object is still garbage collected and its `__del__` tries to release a session that was never attached. The worker now skips that cleanup (`compat.py`), so only the real error is logged. If you still see it, the guard couldn't be applied — look for "Could not guard PyAEDT's Desktop.__del__" in the log. The error to act on is the one *above* it. |
 | Worker can't connect to AEDT | Make sure the full AEDT session is already open on that machine before starting `run_service.py` — it attaches to an existing session (`new_desktop=False`), it does not launch one. If you just clicked Release, that's expected — it detaches on purpose; click Resume. |
 | Post-processing (client pipeline) finds no modes, or fails to reopen the project | Check the `success` flag in the worker's `result.json` for that setup first (§5) — post-processing will raise a clear "not solved" error for a setup that didn't, and that combo's `post_status` becomes `"failed"` without blocking the rest of the run (§9). If it did solve but extraction still fails, see §11's PyAEDT-version notes. |
 | "attempted relative import with no known parent package" | You ran a module inside `ansys_analyze_worker/` directly instead of via `ansys-analyze-worker` / `python -m ansys_analyze_worker.run_service` — see §10. |
