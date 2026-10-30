@@ -72,8 +72,8 @@ repo; §10 covers this repo's own internals.
 
 | Side | Lives in | Runs on | License needed | Job | Changes per experiment? |
 |---|---|---|---|---|---|
-| **Client pipeline** | a separate experiment repo (e.g. `microwave-package`) | Your modeling PC (and anywhere you check on progress or view plots) | Student version -- covers building geometry, creating the analysis setup, AND post-processing an already-solved project | Build the geometry, assign materials/boundaries, create the (single) analysis setup, queue an analysis task per model, wait for and monitor results, reopen each analyzed project to pull out its data and field plots, then plot the combined results | **Yes** -- new/adjusted script per experiment/design |
-| **Worker** | **this repo**, `ansys-analyze-worker` (the `worker/` package) | The PC with the full license, AEDT already open | Full version -- needed for `analyze`/`analyze_setup` only | Sits in the background, watches a queue folder, picks up task files, opens the project, runs the ONE setup the client already created, hands it back | **No** -- generic engine + a small "handler" module per analysis type |
+| **Client pipeline** | a separate experiment repo (e.g. `microwave-package`) | Your modeling PC (and anywhere you check on progress or view plots) | Student version -- covers building geometry, creating the analysis setup, AND post-processing an already-solved project (except reading *fields* out of a solved mesh over the Student size limit -- that is what the worker's `field_exports` are for, §12) | Build the geometry, assign materials/boundaries, create the (single) analysis setup, queue an analysis task per model, wait for and monitor results, reopen each analyzed project to pull out its data and field plots, then plot the combined results | **Yes** -- new/adjusted script per experiment/design |
+| **Worker** | **this repo**, `ansys-analyze-worker` (the `worker/` package) | The PC with the full license, AEDT already open | Full version -- needed for `analyze`/`analyze_setup`, and for reading fields out of large solved meshes (§12) | Sits in the background, watches a queue folder, picks up task files, opens the project, runs the ONE setup the client already created, optionally exports the raw field values the task asked for, hands it back | **No** -- generic engine + a small "handler" module per analysis type |
 
 They are decoupled by a **task queue folder** on disk (`ANSYS_ANALYZE_QUEUE_PATH`):
 
@@ -232,9 +232,10 @@ Each task is one JSON file, `<task_id>.task.json`, in `pending/`.
 | Field | Type | Meaning |
 |---|---|---|
 | `design_name` | str or null | Which design inside the project to open. Omit to use the default/only design. |
-| `parameters` | object | Handler-specific extras, if any. `run_setups` doesn't currently need any — the client already created the setup with every property it needs (frequency, modes, passes, ...) before queuing, so there's nothing left for the worker to configure. Kept in the schema for future handlers that might need it. |
+| `parameters` | object | Handler-specific extras, if any. The client already created the setup with every property it needs (frequency, modes, passes, ...) before queuing, so there's nothing left for the worker to configure. `run_setups` takes one optional extra: **`analyze`** (a real boolean, default `true`); `false` skips the solve, for exporting `field_exports` from a project that is already solved (see "Exporting without solving" below). `validate_task` rejects any non-boolean value, since a string such as `"false"` is truthy and would quietly re-solve. |
 | `objects` | object | Logical name → actual AEDT object name, e.g. `{"chip": "chip_1", "vacuum": "vacuum_1"}`. Not used by the worker — it's read back by the client pipeline's own post-processing step (§9), which uses it the same way the worker used to, to refer to "the chip" without knowing exact import-generated object names. |
 | `post_processing` | list | Which generic post-processing operations to run per result (e.g. field plots). Not run by the worker — see §7, this is entirely a client-side concept now, carried on the task file just so the client's post-processing step can read back what it originally asked for. |
+| `field_exports` | list | Field expressions for the **worker** to evaluate on a grid after solving, written to `fields/<name>.fld` — the one post-solve step that does run on the worker, because the Student version can't load a field solution once the solved mesh is over its size limit (§12). Separate from `post_processing`, which stays client-only. Entry format in "`field_exports` entries" below; what comes back in §5. Omit it and nothing changes. |
 | `metadata` | object | Free-form data that has nothing to do with the analysis itself but that the client pipeline will want later (e.g. `{"pedestal_depth": 4.0}`). Copied through untouched into the results. |
 
 ### Example
@@ -330,6 +331,113 @@ queue_common.write_task_atomically(queue, task)
 queue_common.write_local_marker(project_dir, task_id, queue.root)
 ```
 
+### `field_exports` entries
+
+Student AEDT refuses to load a field solution once the solved mesh is past
+its size limit (`Mesh size (292978 volume elements) is greater than the
+limit for simulation in Ansys Electronics Desktop Student`), and every
+field operation goes through that check: the fields calculator,
+`ExportOnGrid`, field plots. Solution *data* (S-parameters, Touchstone,
+eigenmode frequencies and Q) is unaffected. So when the client needs
+field values out of a large model, it asks the worker — which has the full
+license — to evaluate them once the solve is done. Only that step moves:
+the worker doesn't plot, take statistics, interpret, or create setups. The
+client still creates the setup (with the frequency or mode it wants), reads
+the files back, and does all plotting and analysis.
+
+`field_exports` is a list; each entry is independent:
+
+```json
+"field_exports": [
+  {
+    "name": "substrate_mid_E",
+    "solution": "Setup_F : LastAdaptive",
+    "intrinsics": {"Freq": "12.29GHz", "Phase": "0deg"},
+    "sources": {"port_1:1": ["1W", "0deg"], "port_2:1": ["0W", "0deg"]},
+    "expression": ["Mag_E"],
+    "grid": {"type": "Cartesian", "start": [-25, 1.19, -12.5], "stop": [25, 1.19, 12.5], "step": [0.25, 1, 0.25], "units": "mm"}
+  }
+]
+```
+
+| Key | Required | Meaning |
+|---|---|---|
+| `name` | yes | Letters, digits, `_` and `-`; unique within the task. The file is `fields/<name>.fld` under `output_dir`. |
+| `solution` | yes | Passed to AEDT as-is, e.g. `"Setup_F : LastAdaptive"`. |
+| `intrinsics` | no | Passed to AEDT as-is: `Freq`/`Phase` for a driven run (`{"Freq": "12.29GHz", "Phase": "0deg"}`). The worker doesn't interpret them, so it stays solution-type agnostic (§6). **Eigenmode does not work yet:** `{"Mode": "1", "Phase": "0deg"}` (what the original proposal assumed) made every export fail on real AEDT with `Script macro error`, while the identical call works on a driven design. PyAEDT 1.0.0 lists only `Phase` as an intrinsic of an Eigenmode design, so `Mode` is probably not accepted, and how AEDT selects a mode for a field export is not yet established — see the eigenmode note below. |
+| `sources` | no | Driven only. Excitation name → `"1W"` or `["1W", "0deg"]`, applied with `edit_sources` before that entry is evaluated. Omitted means whatever the sources currently are — which, since entries run in order, is what the previous entry left. The worker closes the project **without saving** when any entry used `sources`, so the project the client gets back is still the one `run_setups` saved. |
+| `expression` | yes | A calculator recipe: a quantity name followed by calculator operations, pushed onto a cleared stack. For the magnitude of a field use the named expressions `["Mag_E"]` / `["Mag_H"]`, which give one clean scalar column. The operations are applied exactly as given and the worker doesn't know what they return, so check: **`["E", "CmplxMag"]` is not \|E\|** — on a vector it exports three columns, some entries negative, whose norm was 1.5–3.4× `Mag_E` at the same points on the model it was tried on. This keeps the worker free of any list of physical quantities. |
+| `grid` | yes | Cartesian `start`, `stop` and `step` (three numbers each) and `units` (default `"mm"`), as `ExportOnGrid` takes them. A plane is a grid with `start == stop` on one axis, but that axis still needs a non-zero `step` — every `step` must be greater than zero. |
+
+Behaviour:
+
+- Needs worker ≥ 0.2.0 and `ansys-analyze-common` ≥ 0.1.4. An older worker
+  doesn't reject the field, it just ignores it, so the task succeeds and no
+  `fields/` folder or `field_exports` block appears in `result.json`.
+- Runs after **all** setups have been analysed, against the saved project.
+- A failed export is recorded in `result.json` (§5) with the error and any
+  new AEDT error messages, and **does not fail the task** or skip the other
+  exports — the same rule `run_setups` applies to a setup that fails to
+  solve. The task still files into `done/`. AEDT's own error text is just
+  `Failed to execute gRPC AEDT command: ExportOnGrid` (or `CalcOp`), so the
+  worker adds what it can: the calculator operation that failed, and — when
+  the `solution` isn't among the design's solutions — the list of ones that
+  are. That list is only added to a failure; a name missing from it is
+  still tried, never refused up front.
+- The setup must have solved fields. A driven setup's `LastAdaptive` keeps
+  fields at its solution frequency; an interpolating sweep doesn't. That is
+  the client's concern, since it creates the setup.
+- The `.fld` file is plain text: a header plus `x y z value` rows (more
+  columns for vectors). What was observed on AEDT with this call, so a
+  reader needn't guess:
+  - the header names millimetres, but the **data rows are in metres** (SI);
+  - rows are ordered **z fastest, then y, then x**;
+  - values at points with no field (inside metal, or outside the field
+    domain) are written as `Nan`. They are still rows, so `points` in
+    `result.json` counts them — a coarse volume grid over a package model
+    had 8914 NaN rows out of 10388;
+  - size: a 201 × 1 × 101 plane (20 301 points) is about 2.8 MB as a
+    three-column vector.
+- Not supported yet: scattered `points` (only a `grid`) and non-Cartesian
+  grids. The validator rejects them with a clear message rather than
+  ignoring them.
+- **Eigenmode is not verified.** Two eigenmode projects (10 and 20 modes,
+  both solved) were tried with `solution: "Setup_1 : LastAdaptive"`,
+  `Mode` 1 and 2, a plane grid, and both `["E", "CmplxMag"]` and
+  `["Mag_E"]`; every export failed with `Failed to execute gRPC AEDT
+  command: ExportOnGrid` and `Script macro error: Abnormal script
+  termination`, where the same plane and expressions work on a driven
+  design. A failed export therefore records what was sent
+  (`export_on_grid_args`) and what the design declares (`design.solutions`
+  and `design.intrinsics`), and names any requested intrinsic the design
+  doesn't list. To find the call AEDT wants, export one mode by hand in
+  AEDT with *Record Script to File* running and compare the recorded
+  `ExportOnGrid` line with `export_on_grid_args`; whatever differs (the
+  intrinsics, the solution name) is the fix.
+
+`queue_common.build_task(..., field_exports=[...])` accepts the list and
+`validate_task` checks every entry's shape, so a mistake is an error on the
+client before queuing, not a failed export on the worker.
+
+**Exporting without solving: `parameters: {"analyze": false}`.** `run_setups`
+normally calls `analyze()`, and for an Eigenmode project that re-solves from
+scratch even when a solution is already saved (17 to 54 minutes in testing,
+where a solved driven setup is skipped in seconds). To take field values out
+of a project that is already solved, queue the same task with
+`parameters={"analyze": False}` (`build_task(..., parameters={"analyze": False})`):
+the worker opens the project, never analyzes and never saves, runs the
+`field_exports`, and closes the project **without saving**, so the project
+the client has is not rewritten. Without `field_exports` such a task has
+nothing to do beyond reporting. In `result.json` the `result` block is the
+usual one per setup, `{"Setup_1": {"success": true, "analyzed": false}}`;
+here `success` only means PyAEDT's `Setup.is_solved` says there is a
+solution (`null` when it couldn't be asked), since nothing was run. A `false`
+is logged and reported but does **not** stop the exports: that probe has been
+seen to say `false` for an eigenmode setup that AEDT's own log reported as
+solved, so refusing on it could block a valid export. If the exports then
+fail, their failure records (above) say why. An older worker ignores the
+flag and solves anyway (slow, but correct).
+
 ---
 
 ## 4. `common/ansys_analyze_common/queue_common.py` — the shared contract
@@ -387,9 +495,12 @@ The worker's job ends the moment it's tried every setup in the project —
 it does NOT extract mode data, build a CSV, or run any field plots. That
 all used to happen here; it's moved to the client pipeline's
 post-processing step (§9), because none of it needs the full license,
-only `analyze`/`analyze_setup` does (§12). So for a successful task, the
-worker writes just ONE small thing into `output_dir` (i.e. back into
-`queue/projects/<task_id>/` itself, once resolved — §2.1):
+only `analyze`/`analyze_setup` does (§12). The one exception is the raw
+field values a task explicitly asks for with `field_exports` (§3), which
+the Student version can't read out of a large solved mesh. So for a
+successful task, the worker writes just ONE small thing into `output_dir`
+(i.e. back into `queue/projects/<task_id>/` itself, once resolved —
+§2.1), plus the field files if any were asked for:
 
 - `result.json` — `status: "success"`, `task_id`, `task_type`,
   `metadata` (copied through from the task file unchanged), and a
@@ -397,6 +508,22 @@ worker writes just ONE small thing into `output_dir` (i.e. back into
   dict keyed by setup name, e.g. `{"Setup_1": {"success": true}}` (or
   `{"Setup_1": {"success": false}, "Setup_2": {"success": true}}` for a
   project with more than one setup where only some solved).
+- `field_exports` — **only when the task asked for any**, beside `result`
+  rather than inside it (that block is keyed by setup name), and the
+  `fields/<name>.fld` files it points at. One entry per requested export,
+  keyed by its `name`:
+
+  ```json
+  "field_exports": {
+    "substrate_mid_E": {"success": true, "file": "fields/substrate_mid_E.fld", "points": 20301},
+    "bad_one": {"success": false, "error": "RuntimeError: ...", "aedt_messages": ["[error] ..."]}
+  }
+  ```
+
+  `file` is relative to `output_dir`; `points` counts the data rows in it.
+  `aedt_messages` (failures only, when readable) are the AEDT error
+  messages that appeared during that export. A task without `field_exports`
+  gets no such key, so `result.json` is unchanged for existing clients.
 
 **A per-setup solve failure does NOT fail the task.** `run_setups`
 runs every setup it finds and records whether each one solved; a `false`
@@ -443,7 +570,12 @@ pedestals, chips, or anything experiment-specific. All it does is:
 4. Look up `HANDLERS[task["task_type"]]` in `ansys_analyze_worker/handlers/`.
 5. Open the project (`Hfss(project=task["project_file"], ...)`).
 6. Call `handler(hfss, task, log)`.
-7. File the task into `done/` or `failed/` and write `result.json`.
+7. Run the task's `field_exports`, if it has any (`field_exports.py`, §3).
+   This is not part of any handler: it works on whatever project the handler
+   left open and solved, it knows no physics (`solution`/`intrinsics` are
+   passed to AEDT as given), and an export that fails is recorded without
+   failing the task.
+8. File the task into `done/` or `failed/` and write `result.json`.
 
 **To support a new solution type: you almost certainly don't need to do
 anything here.** `run_setups` is solution-type agnostic — it opens the
@@ -452,6 +584,14 @@ kind they are. DrivenModal with a frequency sweep goes through it
 unchanged (`setup.analyze()` solves the adaptive passes *and* the sweeps
 under that setup), and so does DrivenTerminal. The client just sets
 `solution_type` on the task. No new handler, no new `task_type`.
+
+Today there is one workflow, `run_setups` (with its legacy alias
+`eigenmode_analyze`). `parameters.analyze: false` turns its solve off so the
+task's `field_exports` can be taken from a project that is already solved
+(§3); that is the same workflow minus a step, not a new one, so it is a
+parameter and not a `task_type`. A handler can mark itself read-only with a
+`run.read_only(task) -> bool` attribute; when it returns `True`, `worker.py`
+closes the project without saving.
 
 **A new handler is for a genuinely different *workflow*** — one that has
 to create state of its own, chain setups together, or drive a non-HFSS
@@ -498,6 +638,14 @@ per-run orchestration) — which pulls out *either* eigenmode results
 `solution_type` — and §9 below for how it fits into the pipeline. The task's `post_processing` list (§3) still describes which
 ops to run per mode; the worker just carries that field through
 untouched now instead of acting on it.
+
+**The one exception is field values of large solved meshes.** Everything
+above works on solution *data*, which the Student version reads fine.
+*Fields* are different: Student refuses to load a field solution once the
+mesh is over its size limit (§12), so for those the client asks the worker to
+evaluate the expressions it needs with a `field_exports` entry (§3) and
+reads the resulting `fields/<name>.fld` files itself. The worker only writes
+the raw numbers; plotting, statistics and interpretation stay here.
 
 ---
 
@@ -696,6 +844,7 @@ this repo's second importable package:
 | `run_service.py` | Entry point. In tray mode (default), sets up logging, hands off to `supervisor.py`, and handles the Reset self-restart. In `--no-tray` mode, runs the worker loop directly on a background thread instead (§10.1 — no supervisor/child-process split needed when there's no tray to keep responsive). |
 | `supervisor.py` | Tray mode only. Runs the worker in its own child process (`multiprocessing`) and exposes the release/resume/stop-current-run/reset control surface `tray_app.py` drives — see §10.1 for why. |
 | `worker.py` | The generic scan/dispatch/file-away loop described in §6, plus the pause/release/stop-event handling that both `run_service.py` (threading.Event, no-tray mode) and `supervisor.py` (multiprocessing.Event, tray mode) drive it with. |
+| `field_exports.py` | The worker's one post-solve step: evaluates the task's `field_exports` (§3) on a grid through `ofieldsreporter` and writes `fields/<name>.fld`. Called by `worker.py` after the handler, not registered as a handler; failures are recorded per export, never raised. |
 | `tray_app.py` | The taskbar icon (via `pystray`) — release/resume, stop current run, open queue folder, open log, reset, exit. |
 | `hpc.py` | Resolves the `cores`/`tasks`/`gpus` the solve runs with (§10.2) — the reason the worker never calls `setup.analyze()` bare. |
 | `compat.py` | Small, guarded workarounds for third-party bugs, each meant to be deleted once upstream catches up. Today: the psutil listening-socket fix for Windows 26H2 and its startup self-check, and a guard that stops PyAEDT's `Desktop.__del__` adding a cleanup traceback after a failed connection (both §13). |
@@ -1007,18 +1156,36 @@ call sites throughout the module.
 ## 12. Student vs. full license — what's actually restricted
 
 Roughly: the **student version can build and save models, create an
-analysis setup, and read/export from an already-solved one** (import
-geometry, assign materials, define boundaries, `create_setup`, field
-plots, solution-data export) -- it's only running the analysis itself
-(`analyze`/`analyze_setup`) that's restricted (reduced problem-size
-limits, and it's a separate license pool from the full/commercial one
-your organization has for the heavy compute).
+analysis setup, and read/export *solution data* from an already-solved
+one** (import geometry, assign materials, define boundaries,
+`create_setup`, S-parameters and Touchstone export, eigenmode frequencies
+and Q) -- it's running the analysis itself (`analyze`/`analyze_setup`)
+that's restricted (reduced problem-size limits, and it's a separate
+license pool from the full/commercial one your organization has for the
+heavy compute).
+
+**One more thing the Student size limit blocks: fields.** Student refuses
+to load a *field* solution once the solved mesh is past its size limit:
+
+```
+[error]  Setup_F: Mesh size (292978 volume elements) is greater than the limit for simulation in Ansys Electronics Desktop Student.
+[error]  Script macro error: Error in performing operation.
+```
+
+Every field operation goes through that check -- the fields calculator,
+`ExportOnGrid`, field plots -- so on a model that large (our package models
+are around 250-300 k elements) the client cannot read any field out of the
+solved project, even though S-parameters, eigenmodes and Touchstone export
+from the very same project work fine. That is why the worker has one narrow
+post-solve step, `field_exports` (§3): evaluate the requested expressions
+at the requested points and write the raw numbers, nothing else.
 
 That's the reasoning behind the client-pipeline/worker split, and it's
-deliberately as narrow as it can be: the full-license worker does exactly
-one thing -- `analyze()` the setup the client already created -- and
-everything else (`create_setup`, and all the post-processing that reads
-back a solved setup) runs on the student-license client. Earlier versions
+deliberately as narrow as it can be: the full-license worker `analyze()`s
+the setup the client already created and, only when the task asks, writes
+out raw field values the Student version can't read -- and everything else
+(`create_setup`, and all the post-processing that reads back a solved
+setup) runs on the student-license client. Earlier versions
 of this pipeline drew the line differently (setup creation AND
 post-processing both behind the worker, with the worker chaining several
 setups per project to search for a target frequency range); that turned
@@ -1047,6 +1214,10 @@ re-testing the whole pipeline against a small batch first.
 | Task appears in `failed/` immediately | Check `<task>.task.json.error.log` next to it — usually a bad `project_file` path, a `task_type` with no registered handler, or a project with no setup at all (`run_setups` needs at least one, but doesn't fail the task over a setup that exists and just didn't solve — see below). |
 | Task reports `success: true` but the client finds no sweep data | The adaptive pass solved and the frequency sweep did not. `success` is in practice just `setup.is_solved`, which queries the *adaptive* solution (`<setup> : LastAdaptive`) and says nothing about the sweeps under it — so a driven setup whose sweep failed still reports `true` and still files into `done/`. That's deliberate (the worker reports what it ran; the client's post-processing is what surfaces missing solution data — §5/§7). Check the HFSS message manager on the worker machine for the sweep's actual error. |
 | A setup didn't actually solve | This does NOT land the task in `failed/` — check the `success` flag for that setup name in the worker's own `result.json` (§5) first, or just let post-processing tell you (next row): it fails clearly, per-combo, the moment it tries to read solution data off an unsolved setup. |
+| A client pipeline gets `Mesh size (...) is greater than the limit for simulation in Ansys Electronics Desktop Student` when it reads a field out of a solved project | Expected for a large mesh — the Student version can't load fields past its size limit (§12). Ask the worker for the values instead, with a `field_exports` entry on the task (§3), and read `fields/<name>.fld` back. |
+| A `field_exports` entry has `success: false` in `result.json` | That export failed but the task didn't — read its `error` and `aedt_messages` (§5). The `error` says which calculator operation failed, for a `solution` that isn't in the design it lists the ones that are, and it names any `intrinsics` the design doesn't declare. The entry also carries `export_on_grid_args` (exactly what was sent to AEDT) and `design` (its solutions and intrinsics) to compare against. Usual causes: a `solution` name that doesn't exist, an `expression` AEDT rejects, or a setup whose fields weren't kept (an interpolating sweep keeps none; use the adaptive solution at the frequency you want — §3). **Every export fails on an Eigenmode design:** see the eigenmode note in §3 — `Mode` is not a verified intrinsic. |
+| A `field_exports` task on an Eigenmode project takes tens of minutes before the first export | `run_setups` always calls `analyze()`, and an Eigenmode project is re-solved from scratch even when its solution is saved. If the project is already solved, queue the same task with `parameters={"analyze": False}`, which never solves (§3). |
+| A fix or feature doesn't seem to take effect on the worker PC | Check the first line of the worker log: `Starting ansys-analyze-worker <version> (git <commit>)` is the build that is actually running (`(editable install)` for a development checkout). Several commits share one version number, so compare the commit. A running worker keeps the old code in memory after `pip install`; tray → Reset (or exiting and relaunching) loads the new code from disk (§10.1). |
 | Solves crawl / AEDT shows a `pyaedt_config` HPC configuration using 1 core | PyAEDT's `Setup.analyze()` default, not an AEDT setting — see §10.2. Worker versions ≥ 0.1.5 pass the real core count instead; on an older one, or to change it, set `ANSYS_ANALYZE_CORES` (§10, §10.2) and **fully exit and relaunch** the worker -- tray → Reset alone won't pick up a newly-set/edited environment variable (§10.2). |
 | AEDT complains about cores or HPC licensing after upgrading the worker | The worker now asks for every logical processor on the machine, which may be more than the HPC license grants. Set `ANSYS_ANALYZE_CORES` to the allowed number (or `aedt` to leave AEDT's own configuration alone) and fully exit and relaunch the worker -- tray → Reset alone won't pick up the new value (§10.2). |
 | Every task fails after about 2 minutes with `Failed to start new AEDT gRPC session on port ...` even though AEDT and its licence are fine; the log has an ERROR "psutil reports a plain listening socket as 'NONE'" at startup | Windows 11 26H2 (build 26300) returns TCP state 0 for listening sockets, psutil reports that as `NONE`, and PyAEDT only recognises a running AEDT by a `LISTEN` socket. Worker versions ≥ 0.1.6 map state 0 to `LISTEN` themselves (`compat.py`) and log one INFO line saying so at startup; on an older one, upgrade. If the ERROR still appears on ≥ 0.1.6, psutil's internals changed — the worker could not apply the fix. Delete `compat.py`'s shim once psutil handles 26H2. Details: [issue #11](https://github.com/d-s-t/ansys-analyze-worker/issues/11). |

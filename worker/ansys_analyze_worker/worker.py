@@ -36,8 +36,47 @@ from ansys_analyze_common.queue_common import QueuePaths, recover_orphaned_tasks
 from . import compat
 from . import stale_locks
 from .handlers import get_handler
+from . import field_exports
 
 logger = logging.getLogger("ansys_analyze_worker")
+
+
+def _is_read_only(handler, task: dict) -> bool:
+    """
+    Whether this task leaves the project unchanged, so it should be closed
+    without saving. A handler opts in with a `read_only(task) -> bool`
+    attribute; anything else (including a Mock) is not read-only.
+    """
+    check = getattr(handler, "read_only", None)
+    try:
+        return callable(check) and check(task) is True
+    except Exception:
+        return False
+
+
+def describe_installation() -> str:
+    """
+    Which build is running, for the first line of the log: the version, and
+    for a pip install from git also the commit (`direct_url.json` records
+    it). The version alone can't say -- several commits share one number --
+    and "was the worker restarted on the new code?" is the first question
+    when a fix doesn't seem to take effect. Never raises.
+    """
+    from . import __version__
+
+    text = f"ansys-analyze-worker {__version__}"
+    try:
+        from importlib import metadata
+
+        direct_url = json.loads(metadata.distribution("ansys-analyze-worker").read_text("direct_url.json") or "{}")
+        commit = (direct_url.get("vcs_info") or {}).get("commit_id")
+        if commit:
+            text += f" (git {commit[:7]})"
+        elif (direct_url.get("dir_info") or {}).get("editable"):
+            text += " (editable install)"
+    except Exception:
+        pass
+    return text
 
 
 class Worker:
@@ -161,6 +200,7 @@ class Worker:
 
     # -- main loop ------------------------------------------------------------
     def run_forever(self) -> None:
+        logger.info("Starting %s", describe_installation())
         compat.apply_psutil_listen_fix()
         compat.check_psutil_listen_status()
         recovered = recover_orphaned_tasks(self.queue)
@@ -245,10 +285,18 @@ class Worker:
             hfss = self._open_project(task)
             try:
                 result = handler(hfss, task, log=logger.info)
+                # The one post-solve step the Student version can't do for
+                # large meshes -- see field_exports.py. {} (and so no change
+                # to result.json) when the task asks for none.
+                exported_fields = field_exports.run(hfss, task, log=logger.info)
             finally:
-                self._close_project(hfss)
+                # Don't save over what the handler saved when exports edited
+                # sources (they changed the project in memory), or when the
+                # handler is read-only and saved nothing to begin with.
+                keep_saved = _is_read_only(handler, task) or field_exports.edits_sources(task)
+                self._close_project(hfss, save=not keep_saved)
 
-            self._finish_success(in_progress_path, task, result)
+            self._finish_success(in_progress_path, task, result, exported_fields)
 
         except Exception as exc:
             self._finish_failure(in_progress_path, task, exc)
@@ -270,14 +318,14 @@ class Worker:
             kwargs["solution_type"] = task["solution_type"]
         return Hfss(**kwargs)
 
-    def _close_project(self, hfss) -> None:
+    def _close_project(self, hfss, save: bool = True) -> None:
         try:
             if hfss and getattr(hfss, "project_name", None):
-                hfss.close_project(name=hfss.project_name)
+                hfss.close_project(name=hfss.project_name, save=save)
         except Exception:
             logger.warning("Failed to close project cleanly.", exc_info=True)
 
-    def _finish_success(self, in_progress_path: str, task: dict, result: dict) -> None:
+    def _finish_success(self, in_progress_path: str, task: dict, result: dict, exported_fields: Optional[dict] = None) -> None:
         out_dir = task["output_dir"]
         os.makedirs(out_dir, exist_ok=True)
         summary = {
@@ -287,6 +335,9 @@ class Worker:
             "metadata": task.get("metadata", {}),
             "result": result,
         }
+        if exported_fields:
+            # Beside "result", not inside it: that block is keyed by setup name.
+            summary["field_exports"] = exported_fields
         with open(os.path.join(out_dir, "result.json"), "w") as f:
             json.dump(summary, f, indent=2, default=str)
 
